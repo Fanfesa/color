@@ -1,0 +1,19 @@
+name: Build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26c
+      - name: Ambil header AML
+        run: |
+          git clone --depth 1 https://github.com/RusJJ/AndroidModLoader aml_repo
+          cp -r aml_repo/mod mod
+      - run: ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libPearlescent
+          path: libs/arm64-v8a/libPearlescent.so
