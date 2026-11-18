@@ -3,14 +3,6 @@
 #include <mod/amlmod.h>
 #include <android/log.h>
 #include <cstdarg>
-
-struct SimpleLogger {
-    void SetTag(const char*) {}
-    void Info(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_INFO, "Pearlescent", f, a); va_end(a); }
-    void Error(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_ERROR, "Pearlescent", f, a); va_end(a); }
-};
-static SimpleLogger g_logger;
-#define logger (&g_logger)
 #include <string>
 #include <vector>
 #include <map>
@@ -23,6 +15,14 @@ static SimpleLogger g_logger;
 #include <dlfcn.h>
 
 MYMOD(net.pearl.gtasa, Pearlescent Colors, 1.0, Pearl)
+
+struct SimpleLogger {
+    void SetTag(const char*) {}
+    void Info(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_INFO, "Pearlescent", f, a); va_end(a); }
+    void Error(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_ERROR, "Pearlescent", f, a); va_end(a); }
+};
+static SimpleLogger g_logger;
+#define logger (&g_logger)
 
 struct RGB { int r, g, b; };
 struct Template { std::string name; RGB a{255,255,255}, b{255,255,255}; float intensity = 1.0f; };
