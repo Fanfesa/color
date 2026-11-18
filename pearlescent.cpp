@@ -37,7 +37,7 @@ static SimpleLogger g_logger;
 #define logger (&g_logger)
 
 struct RGB { int r, g, b; };
-struct Template { std::string name; RGB a{255,255,255}, b{255,255,255}; float intensity = 1.0f; };
+struct Template { std::string name; RGB a{255,255,255}, b{255,255,255}, c{255,255,255}; bool hasC = false; float intensity = 1.0f; };
 struct RwRGBA { unsigned char r, g, b, a; };
 
 // ---- state ----
@@ -57,7 +57,10 @@ static void* (*RpClumpForAllAtomics)(void*, RpAtomicCB, void*);
 static void* (*RpGeometryForAllMaterials)(void*, RpMaterialCB, void*);
 static void* (*RpAtomicGetGeometry_fn)(void*) = nullptr;
 static SetEditableMaterials_t SetEditableMaterials_orig = nullptr;
-static std::vector<void*> g_primary;
+struct PrimMat { void* mat; void* frame; };
+static std::vector<PrimMat> g_primary;
+static void* g_curFrame = nullptr;
+static float g_partSpread = 2.5f;
 
 // ---- pilihan per-mobil ----
 static void* (*GetClumpModelInfo)(void*) = nullptr;
@@ -83,8 +86,9 @@ static const char* kDefaultIni = R"(; Pearlescent Colors (dibuat otomatis)
 mode=all
 active=Purple-Gold
 shift_mode=angle
-angle_gain=1.0
+angle_gain=2.0
 elev_gain=1.5
+part_spread=2.5
 speed=0.5
 intensity=1.0
 
@@ -139,7 +143,7 @@ static void LoadConfig() {
     bool whitelist = false;
     int geomOff = g_geomOff;
     int shiftMode = g_shiftMode;
-    float angleGain = g_angleGain, elevGain = g_elevGain;
+    float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -168,11 +172,13 @@ static void LoadConfig() {
             else if (k == "shift_mode") shiftMode = (v == "time") ? 1 : (v == "both" ? 2 : 0);
             else if (k == "angle_gain") angleGain = (float)atof(v.c_str());
             else if (k == "elev_gain") elevGain = (float)atof(v.c_str());
+            else if (k == "part_spread") partSpread = (float)atof(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (cur) {
             if (k == "a") ParseRGB(v, cur->a);
             else if (k == "b") ParseRGB(v, cur->b);
+            else if (k == "c") { if (ParseRGB(v, cur->c)) cur->hasC = true; }
             else if (k == "intensity") cur->intensity = (float)atof(v.c_str());
         }
     }
@@ -183,7 +189,7 @@ static void LoadConfig() {
     g_tpl = (it != g_templates.end()) ? it->second : g_templates.begin()->second;
     g_speed = speed; g_intensity = inten;
     g_geomOff = geomOff;
-    g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain;
+    g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain; g_partSpread = partSpread;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -197,7 +203,7 @@ static void MaybeReload() {
     if (stat(g_iniPath.c_str(), &st) == 0 && st.st_mtime != g_mtime) LoadConfig();
 }
 
-static bool ViewAngles(void* clump, float& az, float& el) {
+static bool ViewAngles(void* clump, void* partFrame, float& az, float& el) {
     if (!RwFrameGetLTM_fn || !g_scene || !clump) return false;
     void* cam = g_scene[1];
     if (!cam) return false;
@@ -207,7 +213,9 @@ static bool ViewAngles(void* clump, float& az, float& el) {
     const float* v = RwFrameGetLTM_fn(vf);
     const float* c = RwFrameGetLTM_fn(cf);
     if (!v || !c) return false;
-    float dx = c[12] - v[12], dy = c[13] - v[13], dz = c[14] - v[14];
+    const float* pp = v;                                   // posisi bagian (atau mobil)
+    if (partFrame) { const float* q = RwFrameGetLTM_fn(partFrame); if (q) pp = q; }
+    float dx = c[12] - pp[12], dy = c[13] - pp[13], dz = c[14] - pp[14];
     float len = sqrtf(dx * dx + dy * dy + dz * dz);
     if (len < 0.001f) return false;
     dx /= len; dy /= len; dz /= len;
@@ -219,34 +227,51 @@ static bool ViewAngles(void* clump, float& az, float& el) {
     return true;
 }
 
-static RGB Pearl(void* clump, const Template& tp) {
-    float az = 0, el = 0, arg = 0;
-    bool ok = (g_shiftMode != 1) && ViewAngles(clump, az, el);
-    if (ok) arg += az * g_angleGain + el * g_elevGain;
+static RGB Ramp(const Template& tp, float k) {
+    k = k < 0 ? 0 : (k > 1 ? 1 : k);
+    const RGB *p, *q; float u;
+    if (tp.hasC) {
+        if (k < 0.5f) { p = &tp.a; q = &tp.b; u = k * 2.0f; }
+        else          { p = &tp.b; q = &tp.c; u = (k - 0.5f) * 2.0f; }
+    } else { p = &tp.a; q = &tp.b; u = k; }
+    return { Clamp255((int)(p->r + (q->r - p->r) * u)),
+             Clamp255((int)(p->g + (q->g - p->g) * u)),
+             Clamp255((int)(p->b + (q->b - p->b) * u)) };
+}
+
+// Warna untuk satu bagian body (partFrame) pada kendaraan clump
+static RGB Pearl(void* clump, void* partFrame, const Template& tp) {
+    float az0 = 0, el0 = 0, arg = 0;
+    bool ok = (g_shiftMode != 1) && ViewAngles(clump, nullptr, az0, el0);
+    if (ok) {
+        float az1 = az0, el1 = el0;
+        if (partFrame) ViewAngles(clump, partFrame, az1, el1);
+        float dAz = az1 - az0;
+        if (dAz > 3.14159265f) dAz -= 6.2831853f;
+        if (dAz < -3.14159265f) dAz += 6.2831853f;
+        float az = az0 + dAz * g_partSpread, el = el0 + (el1 - el0) * g_partSpread;
+        arg += az * g_angleGain + el * g_elevGain;
+    }
     if (g_shiftMode != 0 || !ok) {
         float phase = (float)(((uintptr_t)clump >> 4) % 1000) / 1000.0f * 6.2831853f;
         arg += (float)(NowSec() * g_speed * 6.2831853) + phase;
     }
     float t = 0.5f + 0.5f * sinf(arg);
     static int logged = 0;
-    if (logged < 6) { logged++; logger->Info("pearl: angle_ok=%d az=%.2f el=%.2f t=%.2f", (int)ok, az, el, t); }
-    float k = t * tp.intensity * g_intensity;
-    k = k < 0 ? 0 : (k > 1 ? 1 : k);
-    return { Clamp255((int)(tp.a.r + (tp.b.r - tp.a.r) * k)),
-             Clamp255((int)(tp.a.g + (tp.b.g - tp.a.g) * k)),
-             Clamp255((int)(tp.a.b + (tp.b.b - tp.a.b) * k)) };
+    if (logged < 8) { logged++; logger->Info("pearl: angle_ok=%d az0=%.2f el0=%.2f arg=%.2f t=%.2f bagian=%p", (int)ok, az0, el0, arg, t, partFrame); }
+    return Ramp(tp, t * tp.intensity * g_intensity);
 }
 
-// Material primary pada DFF mobil bertanda warna (60,255,0)
 static void* OnMaterial(void* mat, void*) {
     RwRGBA* c = (RwRGBA*)((char*)mat + sizeof(void*)); // RpMaterial: texture* lalu color
     g_matSeen++;
-    if (c->r == 60 && c->g == 255 && c->b == 0) g_primary.push_back(mat);
+    if (c->r == 60 && c->g == 255 && c->b == 0) g_primary.push_back({mat, g_curFrame});
     return mat;
 }
 static void* OnAtomic(void* atomic, void*) {
     void* geom = RpAtomicGetGeometry_fn ? RpAtomicGetGeometry_fn(atomic)
                : *(void**)((char*)atomic + g_geomOff);
+    g_curFrame = *(void**)((char*)atomic + sizeof(void*));   // frame bagian body ini
     if (geom) RpGeometryForAllMaterials(geom, OnMaterial, nullptr);
     return atomic;
 }
@@ -296,9 +321,10 @@ static void SetEditableMaterials_hook(void* clump) {
         } else if (g_whitelist) {
             return;  // mobil lain tidak diubah
         }
-        RGB p = Pearl(clump, *tp);
-        for (void* m : g_primary) {
-            RwRGBA* c = (RwRGBA*)((char*)m + sizeof(void*));
+        void* lastFrame = (void*)1; RGB p{0, 0, 0};
+        for (const PrimMat& pm : g_primary) {
+            if (pm.frame != lastFrame) { p = Pearl(clump, pm.frame, *tp); lastFrame = pm.frame; }
+            RwRGBA* c = (RwRGBA*)((char*)pm.mat + sizeof(void*));
             c->r = p.r; c->g = p.g; c->b = p.b;
         }
     }
