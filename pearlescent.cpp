@@ -69,6 +69,8 @@ static std::map<int, std::string> g_carById;
 static std::map<void*, int> g_miIdCache;
 static bool g_needResolve = true;
 static std::set<int> g_loggedIds;
+static int g_geomOff = (sizeof(void*) == 8) ? 48 : 24;  // RpAtomic: object, repEntry, geometry
+static int g_matSeen = 0;
 
 static const char* kDefaultIni = R"(; Pearlescent Colors (dibuat otomatis)
 [settings]
@@ -126,6 +128,7 @@ static void LoadConfig() {
     std::string active = "Purple-Gold", sec;
     float speed = 0.6f, inten = 1.0f;
     bool whitelist = false;
+    int geomOff = g_geomOff;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -150,6 +153,7 @@ static void LoadConfig() {
             else if (k == "speed") speed = (float)atof(v.c_str());
             else if (k == "intensity") inten = (float)atof(v.c_str());
             else if (k == "mode") whitelist = (v == "whitelist");
+            else if (k == "geom_offset") geomOff = atoi(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (cur) {
@@ -164,6 +168,7 @@ static void LoadConfig() {
     auto it = g_templates.find(active);
     g_tpl = (it != g_templates.end()) ? it->second : g_templates.begin()->second;
     g_speed = speed; g_intensity = inten;
+    g_geomOff = geomOff;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -190,12 +195,13 @@ static RGB Pearl(void* clump, const Template& tp) {
 // Material primary pada DFF mobil bertanda warna (60,255,0)
 static void* OnMaterial(void* mat, void*) {
     RwRGBA* c = (RwRGBA*)((char*)mat + sizeof(void*)); // RpMaterial: texture* lalu color
+    g_matSeen++;
     if (c->r == 60 && c->g == 255 && c->b == 0) g_primary.push_back(mat);
     return mat;
 }
 static void* OnAtomic(void* atomic, void*) {
     void* geom = RpAtomicGetGeometry_fn ? RpAtomicGetGeometry_fn(atomic)
-               : *(void**)((char*)atomic + (sizeof(void*) == 8 ? 40 : 20));
+               : *(void**)((char*)atomic + g_geomOff);
     if (geom) RpGeometryForAllMaterials(geom, OnMaterial, nullptr);
     return atomic;
 }
@@ -227,12 +233,13 @@ static void ResolveCars() {
 
 static void SetEditableMaterials_hook(void* clump) {
     g_primary.clear();
+    g_matSeen = 0;
     if (g_ready && clump) { MaybeReload(); RpClumpForAllAtomics(clump, OnAtomic, nullptr); }
     SetEditableMaterials_orig(clump);
     if (g_ready && clump && g_loggedIds.size() < 40) {
         int mid = ModelIdOf(clump);
         if (g_loggedIds.insert(mid).second)
-            logger->Info("kendaraan model id=%d, material primary ditemukan=%d, whitelist=%d", mid, (int)g_primary.size(), (int)g_whitelist);
+            logger->Info("kendaraan model id=%d, material dilihat=%d, primary ditemukan=%d, whitelist=%d, geom_offset=%d", mid, g_matSeen, (int)g_primary.size(), (int)g_whitelist, g_geomOff);
     }
     if (!g_primary.empty()) {
         if (g_needResolve) ResolveCars();
