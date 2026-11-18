@@ -15,6 +15,8 @@
 #include <ctime>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 MYMOD(net.pearl.gtasa, Pearlescent Colors, 1.0, Pearl)
 
@@ -81,6 +83,19 @@ static void** g_scene = nullptr;     // struct Scene { RpWorld*, RwCamera* }
 static int g_shiftMode = 0;          // 0 = angle, 1 = time, 2 = both
 static float g_angleGain = 1.0f, g_elevGain = 1.5f;
 
+// ---- mode pixel (patch shader kendaraan) ----
+static bool  g_shaderOK = false;          // hook glShaderSource terpasang
+static bool  g_shaderPatchEnabled = true; // ini: shader_patch
+static float g_chamGain = 1.6f, g_chamFlow = 0.25f, g_chamBias = 0.0f;
+static std::vector<Template> g_palette;   // dibekukan saat game mulai (maks 32)
+static int g_shaderPatched = 0;
+static void (*glShaderSource_orig)(unsigned, int, const char* const*, const int*) = nullptr;
+
+static int PaletteIndex(const std::string& name) {
+    for (size_t i = 0; i < g_palette.size(); i++) if (g_palette[i].name == name) return (int)i;
+    return 0;
+}
+
 static const char* kDefaultIni = R"(; Pearlescent Colors (dibuat otomatis)
 [settings]
 mode=all
@@ -144,6 +159,8 @@ static void LoadConfig() {
     int geomOff = g_geomOff;
     int shiftMode = g_shiftMode;
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
+    float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
+    bool shaderPatch = g_shaderPatchEnabled;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -169,10 +186,14 @@ static void LoadConfig() {
             else if (k == "intensity") inten = (float)atof(v.c_str());
             else if (k == "mode") whitelist = (v == "whitelist");
             else if (k == "geom_offset") geomOff = atoi(v.c_str());
-            else if (k == "shift_mode") shiftMode = (v == "time") ? 1 : (v == "both" ? 2 : 0);
+            else if (k == "shift_mode") shiftMode = (v == "time") ? 1 : (v == "both" ? 2 : (v == "pixel" ? 3 : 0));
             else if (k == "angle_gain") angleGain = (float)atof(v.c_str());
             else if (k == "elev_gain") elevGain = (float)atof(v.c_str());
             else if (k == "part_spread") partSpread = (float)atof(v.c_str());
+            else if (k == "cham_gain") chamGain = (float)atof(v.c_str());
+            else if (k == "cham_flow") chamFlow = (float)atof(v.c_str());
+            else if (k == "cham_bias") chamBias = (float)atof(v.c_str());
+            else if (k == "shader_patch") shaderPatch = (atoi(v.c_str()) != 0);
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (cur) {
@@ -190,6 +211,7 @@ static void LoadConfig() {
     g_speed = speed; g_intensity = inten;
     g_geomOff = geomOff;
     g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain; g_partSpread = partSpread;
+    g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias; g_shaderPatchEnabled = shaderPatch;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -242,7 +264,8 @@ static RGB Ramp(const Template& tp, float k) {
 // Warna untuk satu bagian body (partFrame) pada kendaraan clump
 static RGB Pearl(void* clump, void* partFrame, const Template& tp) {
     float az0 = 0, el0 = 0, arg = 0;
-    bool ok = (g_shiftMode != 1) && ViewAngles(clump, nullptr, az0, el0);
+    int mode = (g_shiftMode == 3) ? 0 : g_shiftMode;
+    bool ok = (mode != 1) && ViewAngles(clump, nullptr, az0, el0);
     if (ok) {
         float az1 = az0, el1 = el0;
         if (partFrame) ViewAngles(clump, partFrame, az1, el1);
@@ -252,7 +275,7 @@ static RGB Pearl(void* clump, void* partFrame, const Template& tp) {
         float az = az0 + dAz * g_partSpread, el = el0 + (el1 - el0) * g_partSpread;
         arg += az * g_angleGain + el * g_elevGain;
     }
-    if (g_shiftMode != 0 || !ok) {
+    if (mode != 0 || !ok) {
         float phase = (float)(((uintptr_t)clump >> 4) % 1000) / 1000.0f * 6.2831853f;
         arg += (float)(NowSec() * g_speed * 6.2831853) + phase;
     }
@@ -321,6 +344,15 @@ static void SetEditableMaterials_hook(void* clump) {
         } else if (g_whitelist) {
             return;  // mobil lain tidak diubah
         }
+        if (g_shiftMode == 3 && g_shaderOK) {
+            // tandai material primary; shader menghitung warna per piksel
+            int idx = PaletteIndex(tp->name);
+            for (const PrimMat& pm : g_primary) {
+                RwRGBA* c = (RwRGBA*)((char*)pm.mat + sizeof(void*));
+                c->r = 1; c->g = 253; c->b = (unsigned char)(idx * 8);
+            }
+            return;
+        }
         void* lastFrame = (void*)1; RGB p{0, 0, 0};
         for (const PrimMat& pm : g_primary) {
             if (pm.frame != lastFrame) { p = Pearl(clump, pm.frame, *tp); lastFrame = pm.frame; }
@@ -328,6 +360,111 @@ static void SetEditableMaterials_hook(void* clump) {
             c->r = p.r; c->g = p.g; c->b = p.b;
         }
     }
+}
+
+// ================= patch shader (efek per piksel) =================
+static std::string Fl(float v) { char b[32]; snprintf(b, sizeof b, "%.4f", v); return b; }
+static std::string V3(const RGB& c) { return "vec3(" + Fl(c.r / 255.0f) + "," + Fl(c.g / 255.0f) + "," + Fl(c.b / 255.0f) + ")"; }
+
+static std::string BuildPaletteFn() {
+    std::string s = "lowp vec3 ChamPal(float idx, float t) {\n"
+                    " mediump float u1 = clamp(t * 2.0, 0.0, 1.0);\n"
+                    " mediump float u2 = clamp(t * 2.0 - 1.0, 0.0, 1.0);\n";
+    for (size_t i = 0; i < g_palette.size(); i++) {
+        const Template& tp = g_palette[i];
+        s += " if (idx < " + Fl((float)i + 0.5f) + ") return ";
+        if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
+        else         s += "mix(" + V3(tp.a) + "," + V3(tp.b) + ",t);\n";
+    }
+    s += " return vec3(1.0);\n}\n";
+    return s;
+}
+
+static void ReplaceAll(std::string& s, const std::string& a, const std::string& b) {
+    size_t p = 0;
+    while ((p = s.find(a, p)) != std::string::npos) { s.replace(p, a.size(), b); p += b.size(); }
+}
+
+static bool PatchShader(std::string& src) {
+    const size_t np = std::string::npos;
+    const std::string varyings = "varying mediump float Out_Cham;\nvarying mediump vec3 Out_WN;\nvarying mediump vec3 Out_VV;\n";
+    size_t m = src.find("void main()");
+    if (m == np) return false;
+
+    if (src.find("gl_Position") != np) {                       // vertex shader
+        const std::string anchor = "vec3 reflVector = normalize(WorldPos.xyz - CameraPosition.xyz);";
+        size_t a = src.find(anchor);
+        if (a == np || src.find("WorldNormal") == np) return false;
+        std::string expr = "0.0";
+        if (src.find("uniform lowp vec4 MaterialDiffuse") != np)
+            expr = "(abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5 && abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : 0.0";
+        src.replace(a, anchor.size(), anchor + "\nOut_WN = WorldNormal; Out_VV = reflVector; Out_Cham = " + expr + ";\n");
+        src.insert(m, varyings);
+        return true;
+    }
+    if (src.find("gl_FragColor") != np) {                      // fragment shader
+        if (src.find("EnvMapCoefficient") == np || src.find("Out_Color") == np) return false;
+        size_t br = src.find('{', m);
+        if (br == np) return false;
+        std::string head = src.substr(0, m), mid = src.substr(m, br + 1 - m), body = src.substr(br + 1);
+        ReplaceAll(body, "Out_Color", "CCol");
+        std::string block =
+            "lowp vec4 CCol = Out_Color;\n"
+            "if (Out_Cham > 0.5) {\n"
+            " mediump vec3 cN = normalize(Out_WN);\n"
+            " mediump vec3 cV = normalize(Out_VV);\n"
+            " mediump float cF = 1.0 - abs(dot(cV, cN));\n"
+            " mediump vec3 cR = cV - 2.0 * dot(cV, cN) * cN;\n"
+            " mediump float cT = clamp(cF * " + Fl(g_chamGain) + " + cR.z * " + Fl(g_chamFlow) + " + " + Fl(g_chamBias) + ", 0.0, 1.0);\n"
+            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
+            "}\n";
+        src = head + varyings + BuildPaletteFn() + mid + "\n" + block + body;
+        return true;
+    }
+    return false;
+}
+
+static void glShaderSource_hook(unsigned shader, int count, const char* const* str, const int* len) {
+    if (count >= 1 && str) {
+        std::string src;
+        for (int i = 0; i < count; i++) {
+            if (!str[i]) continue;
+            if (len && len[i] >= 0) src.append(str[i], (size_t)len[i]); else src.append(str[i]);
+        }
+        if (PatchShader(src)) {
+            g_shaderPatched++;
+            if (g_shaderPatched <= 4) {
+                std::string dump = g_logPath.substr(0, g_logPath.find_last_of('/') + 1) + "pearlescent_shaders.txt";
+                FILE* fp = fopen(dump.c_str(), g_shaderPatched == 1 ? "w" : "a");
+                if (fp) { fprintf(fp, "===== shader #%d =====\n%s\n", g_shaderPatched, src.c_str()); fclose(fp); }
+            }
+            logger->Info("Shader dipatch (#%d)", g_shaderPatched);
+            const char* ptr = src.c_str();
+            glShaderSource_orig(shader, 1, &ptr, nullptr);
+            return;
+        }
+    }
+    glShaderSource_orig(shader, count, str, len);
+}
+
+// slot GOT glShaderSource di libGTASA.so v2.10 arm64 (relokasi R_AARCH64_JUMP_SLOT 0x8497f8)
+static bool InstallShaderHook(void* anySymInGTASA) {
+    Dl_info di;
+    if (!anySymInGTASA || !dladdr(anySymInGTASA, &di) || !di.dli_fbase) { logger->Error("dladdr gagal"); return false; }
+    uintptr_t base = (uintptr_t)di.dli_fbase;
+    uintptr_t slot = base + 0x8497f8;
+    void** pslot = (void**)slot;
+    void* cur = *pslot;
+    bool inSelf = ((uintptr_t)cur >= base && (uintptr_t)cur < base + 0x1200000);
+    if (!cur || inSelf) { logger->Error("Slot GOT tidak valid (cur=%p), hook shader dilewati", cur); return false; }
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t pg = slot & ~((uintptr_t)ps - 1);
+    if (mprotect((void*)pg, (size_t)ps, PROT_READ | PROT_WRITE) != 0) { logger->Error("mprotect gagal"); return false; }
+    glShaderSource_orig = (decltype(glShaderSource_orig))cur;
+    *pslot = (void*)glShaderSource_hook;
+    mprotect((void*)pg, (size_t)ps, PROT_READ);
+    logger->Info("Hook glShaderSource terpasang (slot=%p asli=%p)", (void*)slot, cur);
+    return true;
 }
 
 ON_MOD_PRELOAD() {
@@ -362,5 +499,10 @@ ON_MOD_PRELOAD() {
     LoadConfig();
     aml->Hook(hook_target, (void*)SetEditableMaterials_hook, (void**)&SetEditableMaterials_orig);
     g_ready = true;
+    for (auto& kv : g_templates) if (g_palette.size() < 32) g_palette.push_back(kv.second);
+    if (g_shiftMode == 3 && g_shaderPatchEnabled) {
+        g_shaderOK = InstallShaderHook(hook_target);
+        if (!g_shaderOK) logger->Error("Mode pixel tidak aktif, memakai mode sudut");
+    }
     logger->Info("Pearlescent aktif. Config: %s", g_iniPath.c_str());
 }
