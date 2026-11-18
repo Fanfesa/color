@@ -8,6 +8,7 @@
 #include <map>
 #include <cmath>
 #include <cctype>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -17,10 +18,20 @@
 
 MYMOD(net.pearl.gtasa, Pearlescent Colors, 1.0, Pearl)
 
+static std::string g_logPath;
 struct SimpleLogger {
     void SetTag(const char*) {}
-    void Info(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_INFO, "Pearlescent", f, a); va_end(a); }
-    void Error(const char* f, ...) { va_list a; va_start(a, f); __android_log_vprint(ANDROID_LOG_ERROR, "Pearlescent", f, a); va_end(a); }
+    void Write(int prio, const char* tag, const char* f, va_list a) {
+        char buf[512];
+        vsnprintf(buf, sizeof buf, f, a);
+        __android_log_print(prio, "Pearlescent", "%s", buf);
+        if (!g_logPath.empty()) {
+            FILE* fp = fopen(g_logPath.c_str(), "a");
+            if (fp) { fprintf(fp, "[%s] %s\n", tag, buf); fclose(fp); }
+        }
+    }
+    void Info(const char* f, ...) { va_list a; va_start(a, f); Write(ANDROID_LOG_INFO, "INFO", f, a); va_end(a); }
+    void Error(const char* f, ...) { va_list a; va_start(a, f); Write(ANDROID_LOG_ERROR, "ERROR", f, a); va_end(a); }
 };
 static SimpleLogger g_logger;
 #define logger (&g_logger)
@@ -57,6 +68,36 @@ static std::map<std::string, std::string> g_carsCfg;   // "buffalo"/"402" -> nam
 static std::map<int, std::string> g_carById;
 static std::map<void*, int> g_miIdCache;
 static bool g_needResolve = true;
+static std::set<int> g_loggedIds;
+
+static const char* kDefaultIni = R"(; Pearlescent Colors (dibuat otomatis)
+[settings]
+mode=all
+active=Purple-Gold
+speed=0.5
+intensity=1.0
+
+[cars]
+;buffalo=Purple-Gold
+
+[custom]
+a=40,120,255
+b=255,60,200
+intensity=1.0
+
+[template:Purple-Gold]
+a=120,40,200
+b=230,180,60
+[template:Blue-Green]
+a=20,80,220
+b=20,220,150
+[template:Red-Orange]
+a=200,20,40
+b=255,140,20
+[template:Sunset]
+a=255,80,60
+b=160,60,220
+)";
 
 static double NowSec() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 static int Clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
@@ -74,7 +115,13 @@ static bool ParseRGB(const std::string& s, RGB& o) {
 
 static void LoadConfig() {
     FILE* f = fopen(g_iniPath.c_str(), "r");
-    if (!f) return;
+    if (!f) {
+        logger->Error("pearlescent.ini tidak ditemukan di %s, membuat file default", g_iniPath.c_str());
+        FILE* w = fopen(g_iniPath.c_str(), "w");
+        if (w) { fputs(kDefaultIni, w); fclose(w); }
+        f = fopen(g_iniPath.c_str(), "r");
+        if (!f) { logger->Error("Gagal membuat/membaca ini"); return; }
+    }
     std::map<std::string, Template> t;
     std::string active = "Purple-Gold", sec;
     float speed = 0.6f, inten = 1.0f;
@@ -182,6 +229,11 @@ static void SetEditableMaterials_hook(void* clump) {
     g_primary.clear();
     if (g_ready && clump) { MaybeReload(); RpClumpForAllAtomics(clump, OnAtomic, nullptr); }
     SetEditableMaterials_orig(clump);
+    if (g_ready && clump && g_loggedIds.size() < 40) {
+        int mid = ModelIdOf(clump);
+        if (g_loggedIds.insert(mid).second)
+            logger->Info("kendaraan model id=%d, material primary ditemukan=%d, whitelist=%d", mid, (int)g_primary.size(), (int)g_whitelist);
+    }
     if (!g_primary.empty()) {
         if (g_needResolve) ResolveCars();
         const Template* tp = &g_tpl;
@@ -208,6 +260,8 @@ ON_MOD_PRELOAD() {
     std::string cfg = aml->GetConfigPath();
     if (!cfg.empty() && cfg.back() != '/') cfg += '/';
     g_iniPath = cfg + "pearlescent.ini";
+    g_logPath = cfg + "pearlescent_log.txt";
+    { FILE* c = fopen(g_logPath.c_str(), "w"); if (c) fclose(c); }
 
     void* hook_target = (void*)aml->GetSym(h, "_ZN17CVehicleModelInfo20SetEditableMaterialsEP7RpClump");
     RpClumpForAllAtomics = (decltype(RpClumpForAllAtomics))aml->GetSym(h, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
