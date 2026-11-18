@@ -7,6 +7,7 @@
 #include <vector>
 #include <map>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -47,6 +48,16 @@ static void* (*RpAtomicGetGeometry_fn)(void*) = nullptr;
 static SetEditableMaterials_t SetEditableMaterials_orig = nullptr;
 static std::vector<void*> g_primary;
 
+// ---- pilihan per-mobil ----
+static void* (*GetClumpModelInfo)(void*) = nullptr;
+static void* (*GetModelInfoByName)(const char*, int*) = nullptr;
+static void** g_modelInfoPtrs = nullptr;               // array 20000 pointer CModelInfo
+static bool g_whitelist = false;                       // true = hanya mobil di [cars]
+static std::map<std::string, std::string> g_carsCfg;   // "buffalo"/"402" -> nama template
+static std::map<int, std::string> g_carById;
+static std::map<void*, int> g_miIdCache;
+static bool g_needResolve = true;
+
 static double NowSec() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 static int Clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
@@ -67,6 +78,8 @@ static void LoadConfig() {
     std::map<std::string, Template> t;
     std::string active = "Purple-Gold", sec;
     float speed = 0.6f, inten = 1.0f;
+    bool whitelist = false;
+    std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
     while (fgets(line, sizeof line, f)) {
@@ -89,6 +102,9 @@ static void LoadConfig() {
             if (k == "active") active = v;
             else if (k == "speed") speed = (float)atof(v.c_str());
             else if (k == "intensity") inten = (float)atof(v.c_str());
+            else if (k == "mode") whitelist = (v == "whitelist");
+        } else if (sec == "cars") {
+            cars[k] = v;
         } else if (cur) {
             if (k == "a") ParseRGB(v, cur->a);
             else if (k == "b") ParseRGB(v, cur->b);
@@ -101,6 +117,7 @@ static void LoadConfig() {
     auto it = g_templates.find(active);
     g_tpl = (it != g_templates.end()) ? it->second : g_templates.begin()->second;
     g_speed = speed; g_intensity = inten;
+    g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
 }
@@ -113,14 +130,14 @@ static void MaybeReload() {
     if (stat(g_iniPath.c_str(), &st) == 0 && st.st_mtime != g_mtime) LoadConfig();
 }
 
-static RGB Pearl(void* clump) {
+static RGB Pearl(void* clump, const Template& tp) {
     float phase = (float)(((uintptr_t)clump >> 4) % 1000) / 1000.0f * 6.2831853f;
     float t = 0.5f + 0.5f * sinf((float)(NowSec() * g_speed * 6.2831853) + phase);
-    float k = t * g_tpl.intensity * g_intensity;
+    float k = t * tp.intensity * g_intensity;
     k = k < 0 ? 0 : (k > 1 ? 1 : k);
-    return { Clamp255((int)(g_tpl.a.r + (g_tpl.b.r - g_tpl.a.r) * k)),
-             Clamp255((int)(g_tpl.a.g + (g_tpl.b.g - g_tpl.a.g) * k)),
-             Clamp255((int)(g_tpl.a.b + (g_tpl.b.b - g_tpl.a.b) * k)) };
+    return { Clamp255((int)(tp.a.r + (tp.b.r - tp.a.r) * k)),
+             Clamp255((int)(tp.a.g + (tp.b.g - tp.a.g) * k)),
+             Clamp255((int)(tp.a.b + (tp.b.b - tp.a.b) * k)) };
 }
 
 // Material primary pada DFF mobil bertanda warna (60,255,0)
@@ -136,12 +153,46 @@ static void* OnAtomic(void* atomic, void*) {
     return atomic;
 }
 
+static int ModelIdOf(void* clump) {
+    if (!GetClumpModelInfo || !g_modelInfoPtrs) return -1;
+    void* mi = GetClumpModelInfo(clump);
+    if (!mi) return -1;
+    auto it = g_miIdCache.find(mi);
+    if (it != g_miIdCache.end()) return it->second;
+    int id = -1;
+    for (int i = 0; i < 20000; i++) if (g_modelInfoPtrs[i] == mi) { id = i; break; }
+    g_miIdCache[mi] = id;
+    return id;
+}
+
+static void ResolveCars() {
+    g_carById.clear();
+    for (auto& kv : g_carsCfg) {
+        const std::string& k = kv.first;
+        int id = -1;
+        if (!k.empty() && isdigit((unsigned char)k[0])) id = atoi(k.c_str());
+        else if (GetModelInfoByName) { int out = -1; if (GetModelInfoByName(k.c_str(), &out) && out >= 0) id = out; }
+        if (id >= 0) g_carById[id] = kv.second;
+        else logger->Error("Mobil tidak ditemukan: %s", k.c_str());
+    }
+    g_needResolve = false;
+}
+
 static void SetEditableMaterials_hook(void* clump) {
     g_primary.clear();
     if (g_ready && clump) { MaybeReload(); RpClumpForAllAtomics(clump, OnAtomic, nullptr); }
     SetEditableMaterials_orig(clump);
     if (!g_primary.empty()) {
-        RGB p = Pearl(clump);
+        if (g_needResolve) ResolveCars();
+        const Template* tp = &g_tpl;
+        auto car = g_carById.find(ModelIdOf(clump));
+        if (car != g_carById.end()) {
+            auto tt = g_templates.find(car->second);
+            if (tt != g_templates.end()) tp = &tt->second;
+        } else if (g_whitelist) {
+            return;  // mobil lain tidak diubah
+        }
+        RGB p = Pearl(clump, *tp);
         for (void* m : g_primary) {
             RwRGBA* c = (RwRGBA*)((char*)m + sizeof(void*));
             c->r = p.r; c->g = p.g; c->b = p.b;
@@ -161,6 +212,10 @@ ON_MOD_PRELOAD() {
     void* hook_target = (void*)aml->GetSym(h, "_ZN17CVehicleModelInfo20SetEditableMaterialsEP7RpClump");
     RpClumpForAllAtomics = (decltype(RpClumpForAllAtomics))aml->GetSym(h, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
     RpGeometryForAllMaterials = (decltype(RpGeometryForAllMaterials))aml->GetSym(h, "_Z25RpGeometryForAllMaterialsP10RpGeometryPFP10RpMaterialS2_PvES3_");
+    GetClumpModelInfo = (decltype(GetClumpModelInfo))aml->GetSym(h, "_ZN18CVisibilityPlugins17GetClumpModelInfoEP7RpClump");
+    GetModelInfoByName = (decltype(GetModelInfoByName))aml->GetSym(h, "_ZN10CModelInfo12GetModelInfoEPKcPi");
+    g_modelInfoPtrs = (void**)aml->GetSym(h, "_ZN10CModelInfo16ms_modelInfoPtrsE");
+    if (!GetClumpModelInfo || !g_modelInfoPtrs) logger->Error("Fitur per-mobil tidak tersedia (simbol tidak ada)");
     RpAtomicGetGeometry_fn = (decltype(RpAtomicGetGeometry_fn))aml->GetSym(h, "_Z18RpAtomicGetGeometryP8RpAtomic");
 
     if (!hook_target || !RpClumpForAllAtomics || !RpGeometryForAllMaterials) {
