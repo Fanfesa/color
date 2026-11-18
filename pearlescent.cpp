@@ -2,6 +2,7 @@
 // Warna body utama (primary) mobil bergeser halus antara warna A dan B.
 #include <mod/amlmod.h>
 #include <mod/logger.h>
+#include <mod/config.h>
 #include <string>
 #include <vector>
 #include <map>
