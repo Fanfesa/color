@@ -72,10 +72,19 @@ static std::set<int> g_loggedIds;
 static int g_geomOff = (sizeof(void*) == 8) ? 48 : 24;  // RpAtomic: object, repEntry, geometry
 static int g_matSeen = 0;
 
+// ---- efek berdasarkan sudut kamera-mobil ----
+static float* (*RwFrameGetLTM_fn)(void*) = nullptr;
+static void** g_scene = nullptr;     // struct Scene { RpWorld*, RwCamera* }
+static int g_shiftMode = 0;          // 0 = angle, 1 = time, 2 = both
+static float g_angleGain = 1.0f, g_elevGain = 1.5f;
+
 static const char* kDefaultIni = R"(; Pearlescent Colors (dibuat otomatis)
 [settings]
 mode=all
 active=Purple-Gold
+shift_mode=angle
+angle_gain=1.0
+elev_gain=1.5
 speed=0.5
 intensity=1.0
 
@@ -129,6 +138,8 @@ static void LoadConfig() {
     float speed = 0.6f, inten = 1.0f;
     bool whitelist = false;
     int geomOff = g_geomOff;
+    int shiftMode = g_shiftMode;
+    float angleGain = g_angleGain, elevGain = g_elevGain;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -154,6 +165,9 @@ static void LoadConfig() {
             else if (k == "intensity") inten = (float)atof(v.c_str());
             else if (k == "mode") whitelist = (v == "whitelist");
             else if (k == "geom_offset") geomOff = atoi(v.c_str());
+            else if (k == "shift_mode") shiftMode = (v == "time") ? 1 : (v == "both" ? 2 : 0);
+            else if (k == "angle_gain") angleGain = (float)atof(v.c_str());
+            else if (k == "elev_gain") elevGain = (float)atof(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (cur) {
@@ -169,6 +183,7 @@ static void LoadConfig() {
     g_tpl = (it != g_templates.end()) ? it->second : g_templates.begin()->second;
     g_speed = speed; g_intensity = inten;
     g_geomOff = geomOff;
+    g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -182,9 +197,39 @@ static void MaybeReload() {
     if (stat(g_iniPath.c_str(), &st) == 0 && st.st_mtime != g_mtime) LoadConfig();
 }
 
+static bool ViewAngles(void* clump, float& az, float& el) {
+    if (!RwFrameGetLTM_fn || !g_scene || !clump) return false;
+    void* cam = g_scene[1];
+    if (!cam) return false;
+    void* vf = *(void**)((char*)clump + sizeof(void*));   // RwObject.parent = frame
+    void* cf = *(void**)((char*)cam + sizeof(void*));
+    if (!vf || !cf) return false;
+    const float* v = RwFrameGetLTM_fn(vf);
+    const float* c = RwFrameGetLTM_fn(cf);
+    if (!v || !c) return false;
+    float dx = c[12] - v[12], dy = c[13] - v[13], dz = c[14] - v[14];
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len < 0.001f) return false;
+    dx /= len; dy /= len; dz /= len;
+    float x = dx * v[0] + dy * v[1] + dz * v[2];     // sumbu kanan mobil
+    float z = dx * v[4] + dy * v[5] + dz * v[6];     // sumbu atas mobil
+    float y = dx * v[8] + dy * v[9] + dz * v[10];    // sumbu depan mobil
+    az = atan2f(x, y);                               // 0 = kamera di depan mobil
+    el = asinf(z < -1 ? -1 : (z > 1 ? 1 : z));       // sudut elevasi kamera
+    return true;
+}
+
 static RGB Pearl(void* clump, const Template& tp) {
-    float phase = (float)(((uintptr_t)clump >> 4) % 1000) / 1000.0f * 6.2831853f;
-    float t = 0.5f + 0.5f * sinf((float)(NowSec() * g_speed * 6.2831853) + phase);
+    float az = 0, el = 0, arg = 0;
+    bool ok = (g_shiftMode != 1) && ViewAngles(clump, az, el);
+    if (ok) arg += az * g_angleGain + el * g_elevGain;
+    if (g_shiftMode != 0 || !ok) {
+        float phase = (float)(((uintptr_t)clump >> 4) % 1000) / 1000.0f * 6.2831853f;
+        arg += (float)(NowSec() * g_speed * 6.2831853) + phase;
+    }
+    float t = 0.5f + 0.5f * sinf(arg);
+    static int logged = 0;
+    if (logged < 6) { logged++; logger->Info("pearl: angle_ok=%d az=%.2f el=%.2f t=%.2f", (int)ok, az, el, t); }
     float k = t * tp.intensity * g_intensity;
     k = k < 0 ? 0 : (k > 1 ? 1 : k);
     return { Clamp255((int)(tp.a.r + (tp.b.r - tp.a.r) * k)),
@@ -277,6 +322,9 @@ ON_MOD_PRELOAD() {
     GetModelInfoByName = (decltype(GetModelInfoByName))aml->GetSym(h, "_ZN10CModelInfo12GetModelInfoEPKcPi");
     g_modelInfoPtrs = (void**)aml->GetSym(h, "_ZN10CModelInfo16ms_modelInfoPtrsE");
     if (!GetClumpModelInfo || !g_modelInfoPtrs) logger->Error("Fitur per-mobil tidak tersedia (simbol tidak ada)");
+    RwFrameGetLTM_fn = (decltype(RwFrameGetLTM_fn))aml->GetSym(h, "_Z13RwFrameGetLTMP7RwFrame");
+    g_scene = (void**)aml->GetSym(h, "Scene");
+    if (!RwFrameGetLTM_fn || !g_scene) logger->Error("Mode sudut tidak tersedia, memakai mode waktu");
     RpAtomicGetGeometry_fn = (decltype(RpAtomicGetGeometry_fn))aml->GetSym(h, "_Z18RpAtomicGetGeometryP8RpAtomic");
 
     if (!hook_target || !RpClumpForAllAtomics || !RpGeometryForAllMaterials) {
