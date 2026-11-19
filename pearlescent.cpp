@@ -87,6 +87,7 @@ static float g_angleGain = 1.0f, g_elevGain = 1.5f;
 static bool  g_shaderOK = false;          // hook glShaderSource terpasang
 static bool  g_shaderPatchEnabled = true; // ini: shader_patch
 static float g_chamGain = 1.6f, g_chamFlow = 0.25f, g_chamBias = 0.0f;
+static float g_chamReflect = 0.22f, g_chamFresnel = 0.5f, g_chamDepth = 0.25f, g_chamFlake = 0.08f, g_chamBright = 0.9f;
 static std::vector<Template> g_palette;   // dibekukan saat game mulai (maks 32)
 static int g_shaderPatched = 0;
 static void (*glShaderSource_orig)(unsigned, int, const char* const*, const int*) = nullptr;
@@ -160,6 +161,7 @@ static void LoadConfig() {
     int shiftMode = g_shiftMode;
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
+    float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
     bool shaderPatch = g_shaderPatchEnabled;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
@@ -193,6 +195,11 @@ static void LoadConfig() {
             else if (k == "cham_gain") chamGain = (float)atof(v.c_str());
             else if (k == "cham_flow") chamFlow = (float)atof(v.c_str());
             else if (k == "cham_bias") chamBias = (float)atof(v.c_str());
+            else if (k == "cham_reflect") chamReflect = (float)atof(v.c_str());
+            else if (k == "cham_fresnel") chamFresnel = (float)atof(v.c_str());
+            else if (k == "cham_depth") chamDepth = (float)atof(v.c_str());
+            else if (k == "cham_flake") chamFlake = (float)atof(v.c_str());
+            else if (k == "cham_brightness") chamBright = (float)atof(v.c_str());
             else if (k == "shader_patch") shaderPatch = (atoi(v.c_str()) != 0);
         } else if (sec == "cars") {
             cars[k] = v;
@@ -211,7 +218,8 @@ static void LoadConfig() {
     g_speed = speed; g_intensity = inten;
     g_geomOff = geomOff;
     g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain; g_partSpread = partSpread;
-    g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias; g_shaderPatchEnabled = shaderPatch;
+    g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias;
+    g_chamReflect = chamReflect; g_chamFresnel = chamFresnel; g_chamDepth = chamDepth; g_chamFlake = chamFlake; g_chamBright = chamBright; g_shaderPatchEnabled = shaderPatch;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -368,13 +376,14 @@ static std::string V3(const RGB& c) { return "vec3(" + Fl(c.r / 255.0f) + "," + 
 
 static std::string BuildPaletteFn() {
     std::string s = "lowp vec3 ChamPal(float idx, float t) {\n"
-                    " mediump float u1 = clamp(t * 2.0, 0.0, 1.0);\n"
-                    " mediump float u2 = clamp(t * 2.0 - 1.0, 0.0, 1.0);\n";
+                    " mediump float u1 = smoothstep(0.0, 1.0, clamp(t * 2.0, 0.0, 1.0));\n"
+                    " mediump float u2 = smoothstep(0.0, 1.0, clamp(t * 2.0 - 1.0, 0.0, 1.0));\n"
+                    " mediump float us = smoothstep(0.0, 1.0, t);\n";
     for (size_t i = 0; i < g_palette.size(); i++) {
         const Template& tp = g_palette[i];
         s += " if (idx < " + Fl((float)i + 0.5f) + ") return ";
         if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
-        else         s += "mix(" + V3(tp.a) + "," + V3(tp.b) + ",t);\n";
+        else         s += "mix(" + V3(tp.a) + "," + V3(tp.b) + ",us);\n";
     }
     s += " return vec3(1.0);\n}\n";
     return s;
@@ -408,15 +417,25 @@ static bool PatchShader(std::string& src) {
         if (br == np) return false;
         std::string head = src.substr(0, m), mid = src.substr(m, br + 1 - m), body = src.substr(br + 1);
         ReplaceAll(body, "Out_Color", "CCol");
+        ReplaceAll(body, "EnvMapCoefficient", "CEnv");
         std::string block =
             "lowp vec4 CCol = Out_Color;\n"
+            "lowp float CEnv = EnvMapCoefficient;\n"
             "if (Out_Cham > 0.5) {\n"
             " mediump vec3 cN = normalize(Out_WN);\n"
             " mediump vec3 cV = normalize(Out_VV);\n"
             " mediump float cF = 1.0 - abs(dot(cV, cN));\n"
             " mediump vec3 cR = cV - 2.0 * dot(cV, cN) * cN;\n"
-            " mediump float cT = clamp(cF * " + Fl(g_chamGain) + " + cR.z * " + Fl(g_chamFlow) + " + " + Fl(g_chamBias) + ", 0.0, 1.0);\n"
-            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
+            "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+            " highp float cG = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+            "#else\n"
+            " mediump float cG = 0.5;\n"
+            "#endif\n"
+            " mediump float cT = clamp(cF * " + Fl(g_chamGain) + " + cR.z * " + Fl(g_chamFlow) + " + " + Fl(g_chamBias) + " + (cG - 0.5) * " + Fl(g_chamFlake * 0.6f) + ", 0.0, 1.0);\n"
+            " mediump float cL = clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
+            " mediump float cS = mix(1.0 - " + Fl(g_chamDepth) + ", 1.0, cT);\n"
+            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * (cL * cS * " + Fl(g_chamBright) + ") * (1.0 + (cG - 0.5) * " + Fl(g_chamFlake) + ");\n"
+            " CEnv = clamp(max(EnvMapCoefficient, " + Fl(g_chamReflect) + ") + cF * cF * " + Fl(g_chamFresnel) + ", 0.0, 0.7);\n"
             "}\n";
         src = head + varyings + BuildPaletteFn() + mid + "\n" + block + body;
         return true;
