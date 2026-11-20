@@ -2,12 +2,17 @@
 // Warna body utama (primary) mobil bergeser halus antara warna A dan B.
 #include <mod/amlmod.h>
 #include <android/log.h>
+#include <GLES2/gl2.h>
+#include "imgui.h"
+#include "imgui_impl_opengl3.h"
 #include <cstdarg>
 #include <string>
 #include <vector>
 #include <map>
 #include <cmath>
 #include <cctype>
+#include <cfloat>
+#include <cstdint>
 #include <set>
 #include <cstdio>
 #include <cstring>
@@ -90,6 +95,21 @@ static float g_chamGain = 1.6f, g_chamFlow = 0.25f, g_chamBias = 0.0f;
 static float g_chamReflect = 0.22f, g_chamFresnel = 0.5f, g_chamDepth = 0.25f, g_chamFlake = 0.08f, g_chamBright = 0.9f;
 static std::vector<Template> g_palette;   // dibekukan saat game mulai (maks 32)
 static int g_shaderPatched = 0;
+static unsigned g_uniVersion = 1;         // naik setiap parameter shader live berubah
+
+// ---- menu in-game ----
+static bool  g_menuEnabled = true;        // ini: menu
+static bool  g_menuOpen = false, g_menuReady = false, g_menuFailed = false;
+static float g_menuScale = 0.0f;          // 0 = otomatis
+static float g_btnX = 0.44f, g_btnY = 0.02f;
+static bool  g_enabled = true;            // master on/off
+struct UiRect { float x0, y0, x1, y1; bool valid; };
+static UiRect g_uiRects[2] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
+static bool g_latch[2] = {false, false}, g_prevDown[2] = {false, false};
+static int  (*GetButton_orig)(int, int) = nullptr;
+static int  (*GetCoords_orig)(int, int*, int*, float*) = nullptr;
+static void (*SwapBuffers_orig)() = nullptr;
+static void* (*FindPlayerVehicle_fn)(int, bool) = nullptr;
 static void (*glShaderSource_orig)(unsigned, int, const char* const*, const int*) = nullptr;
 
 static int PaletteIndex(const std::string& name) {
@@ -162,7 +182,8 @@ static void LoadConfig() {
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
-    bool shaderPatch = g_shaderPatchEnabled;
+    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled;
+    float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -201,6 +222,10 @@ static void LoadConfig() {
             else if (k == "cham_flake") chamFlake = (float)atof(v.c_str());
             else if (k == "cham_brightness") chamBright = (float)atof(v.c_str());
             else if (k == "shader_patch") shaderPatch = (atoi(v.c_str()) != 0);
+            else if (k == "menu") menuOn = (atoi(v.c_str()) != 0);
+            else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
+            else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
+            else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (cur) {
@@ -220,6 +245,8 @@ static void LoadConfig() {
     g_shiftMode = shiftMode; g_angleGain = angleGain; g_elevGain = elevGain; g_partSpread = partSpread;
     g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias;
     g_chamReflect = chamReflect; g_chamFresnel = chamFresnel; g_chamDepth = chamDepth; g_chamFlake = chamFlake; g_chamBright = chamBright; g_shaderPatchEnabled = shaderPatch;
+    g_menuEnabled = menuOn; g_menuScale = menuScale; g_btnX = btnX; g_btnY = btnY;
+    g_uniVersion++;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
@@ -342,7 +369,7 @@ static void SetEditableMaterials_hook(void* clump) {
         if (g_loggedIds.insert(mid).second)
             logger->Info("kendaraan model id=%d, material dilihat=%d, primary ditemukan=%d, whitelist=%d, geom_offset=%d", mid, g_matSeen, (int)g_primary.size(), (int)g_whitelist, g_geomOff);
     }
-    if (!g_primary.empty()) {
+    if (g_enabled && !g_primary.empty()) {
         if (g_needResolve) ResolveCars();
         const Template* tp = &g_tpl;
         auto car = g_carById.find(ModelIdOf(clump));
@@ -382,7 +409,8 @@ static std::string BuildPaletteFn() {
     for (size_t i = 0; i < g_palette.size(); i++) {
         const Template& tp = g_palette[i];
         s += " if (idx < " + Fl((float)i + 0.5f) + ") return ";
-        if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
+        if (tp.name == "custom") s += "mix(mix(ChamA,ChamB,u1),ChamC,u2);\n";
+        else if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
         else         s += "mix(" + V3(tp.a) + "," + V3(tp.b) + ",us);\n";
     }
     s += " return vec3(1.0);\n}\n";
@@ -397,6 +425,7 @@ static void ReplaceAll(std::string& s, const std::string& a, const std::string& 
 static bool PatchShader(std::string& src) {
     const size_t np = std::string::npos;
     const std::string varyings = "varying mediump float Out_Cham;\nvarying mediump vec3 Out_WN;\nvarying mediump vec3 Out_VV;\n";
+    const std::string uniforms = "uniform mediump vec4 ChamP0;\nuniform mediump vec4 ChamP1;\nuniform mediump vec3 ChamA;\nuniform mediump vec3 ChamB;\nuniform mediump vec3 ChamC;\n";
     size_t m = src.find("void main()");
     if (m == np) return false;
 
@@ -431,13 +460,13 @@ static bool PatchShader(std::string& src) {
             "#else\n"
             " mediump float cG = 0.5;\n"
             "#endif\n"
-            " mediump float cT = clamp(cF * " + Fl(g_chamGain) + " + cR.z * " + Fl(g_chamFlow) + " + " + Fl(g_chamBias) + " + (cG - 0.5) * " + Fl(g_chamFlake * 0.6f) + ", 0.0, 1.0);\n"
+            " mediump float cT = clamp(cF * ChamP0.x + cR.z * ChamP0.y + ChamP0.z + (cG - 0.5) * ChamP1.z * 0.6, 0.0, 1.0);\n"
             " mediump float cL = clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
-            " mediump float cS = mix(1.0 - " + Fl(g_chamDepth) + ", 1.0, cT);\n"
-            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * (cL * cS * " + Fl(g_chamBright) + ") * (1.0 + (cG - 0.5) * " + Fl(g_chamFlake) + ");\n"
-            " CEnv = clamp(max(EnvMapCoefficient, " + Fl(g_chamReflect) + ") + cF * cF * " + Fl(g_chamFresnel) + ", 0.0, 0.7);\n"
+            " mediump float cS = mix(1.0 - ChamP0.w, 1.0, cT);\n"
+            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * (cL * cS * ChamP1.w) * (1.0 + (cG - 0.5) * ChamP1.z);\n"
+            " CEnv = clamp(max(EnvMapCoefficient, ChamP1.x) + cF * cF * ChamP1.y, 0.0, 0.7);\n"
             "}\n";
-        src = head + varyings + BuildPaletteFn() + mid + "\n" + block + body;
+        src = head + varyings + uniforms + BuildPaletteFn() + mid + "\n" + block + body;
         return true;
     }
     return false;
@@ -466,24 +495,374 @@ static void glShaderSource_hook(unsigned shader, int count, const char* const* s
     glShaderSource_orig(shader, count, str, len);
 }
 
-// slot GOT glShaderSource di libGTASA.so v2.10 arm64 (relokasi R_AARCH64_JUMP_SLOT 0x8497f8)
-static bool InstallShaderHook(void* anySymInGTASA) {
+// ---------- hook GOT generik (libGTASA v2.10 arm64) ----------
+// expectOff != 0: fungsi milik libGTASA sendiri (slot harus berisi base+expectOff)
+// expectOff == 0: fungsi import dari libGLESv2 (slot harus terisi dan bukan milik libGTASA)
+static bool InstallGotHook(void* anySym, uintptr_t slotOff, uintptr_t expectOff, void* hook, void** orig, const char* name) {
     Dl_info di;
-    if (!anySymInGTASA || !dladdr(anySymInGTASA, &di) || !di.dli_fbase) { logger->Error("dladdr gagal"); return false; }
+    if (!anySym || !dladdr(anySym, &di) || !di.dli_fbase) { logger->Error("dladdr gagal (%s)", name); return false; }
     uintptr_t base = (uintptr_t)di.dli_fbase;
-    uintptr_t slot = base + 0x8497f8;
-    void** pslot = (void**)slot;
+    void** pslot = (void**)(base + slotOff);
     void* cur = *pslot;
     bool inSelf = ((uintptr_t)cur >= base && (uintptr_t)cur < base + 0x1200000);
-    if (!cur || inSelf) { logger->Error("Slot GOT tidak valid (cur=%p), hook shader dilewati", cur); return false; }
+    bool valid = expectOff ? ((uintptr_t)cur == base + expectOff) : (cur && !inSelf);
+    if (!valid) { logger->Error("Slot GOT %s tidak valid (cur=%p)", name, cur); return false; }
     long ps = sysconf(_SC_PAGESIZE);
-    uintptr_t pg = slot & ~((uintptr_t)ps - 1);
-    if (mprotect((void*)pg, (size_t)ps, PROT_READ | PROT_WRITE) != 0) { logger->Error("mprotect gagal"); return false; }
-    glShaderSource_orig = (decltype(glShaderSource_orig))cur;
-    *pslot = (void*)glShaderSource_hook;
+    uintptr_t pg = (base + slotOff) & ~((uintptr_t)ps - 1);
+    if (mprotect((void*)pg, (size_t)ps, PROT_READ | PROT_WRITE) != 0) { logger->Error("mprotect gagal (%s)", name); return false; }
+    *orig = cur;
+    *pslot = hook;
     mprotect((void*)pg, (size_t)ps, PROT_READ);
-    logger->Info("Hook glShaderSource terpasang (slot=%p asli=%p)", (void*)slot, cur);
+    logger->Info("Hook %s terpasang", name);
     return true;
+}
+
+// ---------- uniform live untuk shader chameleon ----------
+static void (*glUseProgram_orig)(unsigned) = nullptr;
+static void (*glLinkProgram_orig)(unsigned) = nullptr;
+struct ProgLocs { int p0 = -1, p1 = -1, a = -1, b = -1, c = -1; unsigned ver = 0; bool known = false; };
+static std::map<unsigned, ProgLocs> g_progs;
+
+static void SetChamUniforms(const ProgLocs& L) {
+    glUniform4f(L.p0, g_chamGain, g_chamFlow, g_chamBias, g_chamDepth);
+    if (L.p1 >= 0) glUniform4f(L.p1, g_chamReflect, g_chamFresnel, g_chamFlake, g_chamBright);
+    RGB a{255, 255, 255}, b = a, c = a;
+    auto it = g_templates.find("custom");
+    if (it != g_templates.end()) { a = it->second.a; b = it->second.b; c = it->second.hasC ? it->second.c : it->second.b; }
+    if (L.a >= 0) glUniform3f(L.a, a.r / 255.0f, a.g / 255.0f, a.b / 255.0f);
+    if (L.b >= 0) glUniform3f(L.b, b.r / 255.0f, b.g / 255.0f, b.b / 255.0f);
+    if (L.c >= 0) glUniform3f(L.c, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+}
+
+static void glUseProgram_hook(unsigned prog) {
+    glUseProgram_orig(prog);
+    if (!prog || g_shaderPatched == 0) return;
+    ProgLocs& L = g_progs[prog];
+    if (!L.known) {
+        L.p0 = glGetUniformLocation(prog, "ChamP0");
+        L.p1 = glGetUniformLocation(prog, "ChamP1");
+        L.a = glGetUniformLocation(prog, "ChamA");
+        L.b = glGetUniformLocation(prog, "ChamB");
+        L.c = glGetUniformLocation(prog, "ChamC");
+        L.known = true;
+    }
+    if (L.p0 < 0 || L.ver == g_uniVersion) return;
+    SetChamUniforms(L);
+    L.ver = g_uniVersion;
+}
+
+static void glLinkProgram_hook(unsigned prog) {
+    glLinkProgram_orig(prog);
+    g_progs.erase(prog);
+}
+
+// ================= simpan config =================
+static const char* ShiftName(int m) { return m == 1 ? "time" : (m == 2 ? "both" : (m == 3 ? "pixel" : "angle")); }
+
+static void WriteTpl(FILE* f, const Template& t) {
+    if (t.name == "custom") fprintf(f, "\n[custom]\n"); else fprintf(f, "\n[template:%s]\n", t.name.c_str());
+    fprintf(f, "a=%d,%d,%d\nb=%d,%d,%d\n", t.a.r, t.a.g, t.a.b, t.b.r, t.b.g, t.b.b);
+    if (t.hasC) fprintf(f, "c=%d,%d,%d\n", t.c.r, t.c.g, t.c.b);
+    if (t.intensity != 1.0f) fprintf(f, "intensity=%.2f\n", t.intensity);
+}
+
+static void SaveConfig() {
+    FILE* f = fopen(g_iniPath.c_str(), "w");
+    if (!f) { logger->Error("Gagal menyimpan %s", g_iniPath.c_str()); return; }
+    fprintf(f, "; Pearlescent Colors - disimpan dari menu in-game\n[settings]\n");
+    fprintf(f, "mode=%s\nactive=%s\nshift_mode=%s\n", g_whitelist ? "whitelist" : "all", g_tpl.name.c_str(), ShiftName(g_shiftMode));
+    fprintf(f, "angle_gain=%.2f\nelev_gain=%.2f\npart_spread=%.2f\nspeed=%.2f\nintensity=%.2f\n", g_angleGain, g_elevGain, g_partSpread, g_speed, g_intensity);
+    fprintf(f, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
+    fprintf(f, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
+            g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
+    fprintf(f, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY);
+    fprintf(f, "\n[cars]\n");
+    for (auto& kv : g_carsCfg) fprintf(f, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
+    auto cu = g_templates.find("custom");
+    if (cu != g_templates.end()) WriteTpl(f, cu->second);
+    for (auto& kv : g_templates) if (kv.first != "custom") WriteTpl(f, kv.second);
+    fclose(f);
+    struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
+    logger->Info("Config disimpan dari menu");
+}
+
+// ================= menu in-game (ImGui) =================
+static bool IsDownVal(int v) { return (v | 1) == 3; }   // LIB_PointerGetButton: 2/3 = sedang ditekan
+
+static bool PtInUi(float x, float y) {
+    for (const UiRect& r : g_uiRects)
+        if (r.valid && x >= r.x0 - 8 && x <= r.x1 + 8 && y >= r.y0 - 8 && y <= r.y1 + 8) return true;
+    return false;
+}
+
+// sentuhan yang dimulai di atas menu tidak diteruskan ke game
+static int GetButton_hook(int idx, int btn) {
+    int v = GetButton_orig(idx, btn);
+    if (btn != 0 || idx < 0 || idx > 1 || !g_menuReady) return v;
+    if (!IsDownVal(v)) {
+        bool was = g_latch[idx];
+        g_latch[idx] = false; g_prevDown[idx] = false;
+        return was ? 0 : v;
+    }
+    if (!g_prevDown[idx]) {
+        g_prevDown[idx] = true;
+        int x = 0, y = 0; float pr = 0;
+        if (GetCoords_orig) GetCoords_orig(idx, &x, &y, &pr);
+        g_latch[idx] = PtInUi((float)x, (float)y);
+    }
+    return g_latch[idx] ? 0 : v;
+}
+
+static void SaveRect(int i) {
+    ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+    g_uiRects[i] = { p.x, p.y, p.x + sz.x, p.y + sz.y, true };
+}
+
+static void TouchScroll() {
+    if (ImGui::IsWindowFocused() && ImGui::IsMouseDragging(0, 6.0f) && !ImGui::IsAnyItemActive())
+        ImGui::SetScrollY(ImGui::GetScrollY() - ImGui::GetIO().MouseDelta.y);
+}
+
+static RGB ToRGB(const float* c) {
+    return { Clamp255((int)(c[0] * 255.0f + 0.5f)), Clamp255((int)(c[1] * 255.0f + 0.5f)), Clamp255((int)(c[2] * 255.0f + 0.5f)) };
+}
+
+static int CurrentVehicleModel() {
+    if (!FindPlayerVehicle_fn) return -1;
+    void* v = FindPlayerVehicle_fn(-1, false);
+    if (!v) return -1;
+    int id = -1;
+    void* clump = *(void**)((char*)v + 0x20);               // CEntity::m_pRwObject (64-bit)
+    if (clump) id = ModelIdOf(clump);
+    if (id < 0) id = (int)*(uint16_t*)((char*)v + 0x2E);    // CEntity::m_nModelIndex (64-bit)
+    return (id >= 0 && id < 20000) ? id : -1;
+}
+
+static void BuildUI(float W, float H) {
+    const ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(ImVec2(W * g_btnX, H * g_btnY), ImGuiCond_Always);
+    ImGui::Begin("##pcbtn", nullptr, fl);
+    if (ImGui::Button(g_menuOpen ? "PC  X" : "PC")) g_menuOpen = !g_menuOpen;
+    SaveRect(0);
+    ImGui::End();
+    g_uiRects[1].valid = false;
+    if (!g_menuOpen) return;
+
+    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(W * 0.66f, H * 0.88f), ImGuiCond_Always);
+    ImGui::Begin("Pearlescent Chameleon", &g_menuOpen,
+                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
+    SaveRect(1);
+
+    ImGui::Checkbox("Aktifkan efek", &g_enabled);
+    ImGui::SameLine();
+    if (ImGui::Button("Simpan")) SaveConfig();
+    ImGui::SameLine();
+    if (ImGui::Button("Muat ulang")) { LoadConfig(); g_uniVersion++; }
+    ImGui::TextWrapped("Template aktif: %s | Shader per-piksel: %s", g_tpl.name.c_str(), g_shaderOK ? "aktif" : "tidak aktif");
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Mode & target", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kModes[] = {"Pixel (shader)", "Sudut kamera", "Waktu", "Gabungan"};
+        static const int kModeVal[] = {3, 0, 1, 2};
+        int mi = 0;
+        for (int i = 0; i < 4; i++) if (kModeVal[i] == g_shiftMode) mi = i;
+        if (ImGui::Combo("Mode", &mi, kModes, 4)) g_shiftMode = kModeVal[mi];
+        if (g_shiftMode == 3 && !g_shaderOK) ImGui::TextWrapped("Pixel belum aktif (shader_patch=0 atau hook gagal), dipakai mode sudut.");
+        static const char* kTg[] = {"Semua mobil", "Hanya mobil terdaftar"};
+        int tg = g_whitelist ? 1 : 0;
+        if (ImGui::Combo("Target", &tg, kTg, 2)) g_whitelist = (tg == 1);
+    }
+
+    if (ImGui::CollapsingHeader("Template warna", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginChild("tpllist", ImVec2(0, H * 0.30f), true);
+        for (auto& kv : g_templates) {
+            const Template& t = kv.second;
+            ImGui::PushID(kv.first.c_str());
+            float sz = ImGui::GetFrameHeight();
+            ImGui::ColorButton("##a", ImVec4(t.a.r / 255.0f, t.a.g / 255.0f, t.a.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
+            ImGui::SameLine();
+            ImGui::ColorButton("##b", ImVec4(t.b.r / 255.0f, t.b.g / 255.0f, t.b.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
+            ImGui::SameLine();
+            const RGB& c3 = t.hasC ? t.c : t.b;
+            ImGui::ColorButton("##c", ImVec4(c3.r / 255.0f, c3.g / 255.0f, c3.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
+            ImGui::SameLine();
+            if (ImGui::Selectable(kv.first.c_str(), kv.first == g_tpl.name)) g_tpl = kv.second;
+            ImGui::PopID();
+        }
+        TouchScroll();
+        ImGui::EndChild();
+    }
+
+    if (ImGui::CollapsingHeader("Mix manual (custom)")) {
+        Template& cu = g_templates["custom"];
+        cu.name = "custom";
+        float ca[3] = { cu.a.r / 255.0f, cu.a.g / 255.0f, cu.a.b / 255.0f };
+        float cb[3] = { cu.b.r / 255.0f, cu.b.g / 255.0f, cu.b.b / 255.0f };
+        const RGB& c3 = cu.hasC ? cu.c : cu.b;
+        float cc[3] = { c3.r / 255.0f, c3.g / 255.0f, c3.b / 255.0f };
+        bool chg = false;
+        chg |= ImGui::ColorEdit3("A (hadap kamera)", ca);
+        chg |= ImGui::ColorEdit3("B (tengah)", cb);
+        chg |= ImGui::ColorEdit3("C (tepi)", cc);
+        if (chg) {
+            cu.a = ToRGB(ca); cu.b = ToRGB(cb); cu.c = ToRGB(cc); cu.hasC = true;
+            if (g_tpl.name == "custom") g_tpl = cu;
+            g_uniVersion++;
+        }
+        if (ImGui::Button("Pakai custom")) g_tpl = cu;
+        ImGui::SameLine();
+        if (ImGui::Button("Salin template aktif")) {
+            if (g_tpl.name != "custom") {
+                cu.a = g_tpl.a; cu.b = g_tpl.b; cu.c = g_tpl.hasC ? g_tpl.c : g_tpl.b; cu.hasC = true;
+                g_uniVersion++;
+            }
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Efek per piksel")) {
+        bool ch = false;
+        ch |= ImGui::SliderFloat("Gain sudut", &g_chamGain, 0.2f, 4.0f, "%.2f");
+        ch |= ImGui::SliderFloat("Aliran pantulan", &g_chamFlow, -1.0f, 1.0f, "%.2f");
+        ch |= ImGui::SliderFloat("Geser awal", &g_chamBias, -0.6f, 0.6f, "%.2f");
+        ch |= ImGui::SliderFloat("Kedalaman", &g_chamDepth, 0.0f, 0.8f, "%.2f");
+        ch |= ImGui::SliderFloat("Kilap minimum", &g_chamReflect, 0.0f, 0.6f, "%.2f");
+        ch |= ImGui::SliderFloat("Fresnel", &g_chamFresnel, 0.0f, 1.0f, "%.2f");
+        ch |= ImGui::SliderFloat("Glitter", &g_chamFlake, 0.0f, 0.5f, "%.2f");
+        ch |= ImGui::SliderFloat("Kecerahan", &g_chamBright, 0.3f, 1.5f, "%.2f");
+        if (ch) g_uniVersion++;
+    }
+
+    if (ImGui::CollapsingHeader("Mode sudut / waktu")) {
+        ImGui::SliderFloat("Gain sudut keliling", &g_angleGain, 0.5f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Gain elevasi", &g_elevGain, 0.0f, 4.0f, "%.2f");
+        ImGui::SliderFloat("Beda antar bagian", &g_partSpread, 0.0f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Kecepatan (waktu)", &g_speed, 0.0f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Intensitas", &g_intensity, 0.0f, 1.0f, "%.2f");
+    }
+
+    if (ImGui::CollapsingHeader("Pilih mobil")) {
+        int cur = CurrentVehicleModel();
+        if (cur >= 0) {
+            ImGui::Text("Mobil dikendarai: model %d", cur);
+            if (ImGui::Button("Daftarkan dgn template aktif")) { g_carsCfg[std::to_string(cur)] = g_tpl.name; g_needResolve = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Hapus mobil ini")) { g_carsCfg.erase(std::to_string(cur)); g_needResolve = true; }
+        } else {
+            ImGui::TextWrapped("Naiki sebuah mobil untuk mendaftarkannya.");
+        }
+        ImGui::Separator();
+        ImGui::Text("Daftar mobil (mode 'Hanya mobil terdaftar'):");
+        std::string del;
+        for (auto& kv : g_carsCfg) {
+            ImGui::PushID(kv.first.c_str());
+            if (ImGui::Button("X")) del = kv.first;
+            ImGui::SameLine();
+            ImGui::Text("%s -> %s", kv.first.c_str(), kv.second.c_str());
+            ImGui::PopID();
+        }
+        if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; }
+    }
+
+    if (ImGui::CollapsingHeader("Tombol menu")) {
+        ImGui::SliderFloat("Posisi X", &g_btnX, 0.0f, 0.95f, "%.2f");
+        ImGui::SliderFloat("Posisi Y", &g_btnY, 0.0f, 0.9f, "%.2f");
+    }
+
+    TouchScroll();
+    ImGui::End();
+}
+
+static bool InitMenu() {
+    if (g_menuFailed) return false;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] < 200 || vp[3] < 200) return false;
+    float sc = g_menuScale > 0.0f ? g_menuScale : (float)vp[3] / 480.0f;
+    if (sc < 1.0f) sc = 1.0f;
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ImFontConfig fc;
+    fc.SizePixels = 13.0f * sc;
+    io.Fonts->AddFontDefault(&fc);
+    ImGui::StyleColorsDark();
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.ScaleAllSizes(sc);
+    st.ScrollbarSize = 10.0f * sc;
+    st.WindowRounding = 4.0f * sc;
+    if (!ImGui_ImplOpenGL3_Init("#version 100")) { g_menuFailed = true; logger->Error("Init ImGui gagal"); return false; }
+    g_menuReady = true;
+    logger->Info("Menu ImGui siap (skala %.2f, layar %dx%d)", sc, vp[2], vp[3]);
+    return true;
+}
+
+struct AttribBackup { GLint en, size, type, norm, stride, buf; void* ptr; };
+
+static void DrawMenuFrame() {
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] < 200 || vp[3] < 200) return;
+    float W = (float)vp[2], H = (float)vp[3];
+
+    // simpan state vertex yang tidak dipulihkan backend ImGui
+    GLint prevArray = 0, prevElem = 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArray);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &prevElem);
+    AttribBackup ab[8];
+    for (int i = 0; i < 8; i++) {
+        ab[i] = {0, 4, GL_FLOAT, 0, 0, 0, nullptr};
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &ab[i].en);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &ab[i].size);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ab[i].type);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &ab[i].norm);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &ab[i].stride);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &ab[i].buf);
+        glGetVertexAttribPointerv(i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ab[i].ptr);
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(W, H);
+    static double lastT = 0;
+    double now = NowSec();
+    io.DeltaTime = (lastT > 0 && now > lastT) ? (float)(now - lastT) : (1.0f / 60.0f);
+    lastT = now;
+
+    // input sentuh: pointer 0
+    static bool wasDown = false;
+    int v = GetButton_orig ? GetButton_orig(0, 0) : 0;
+    bool down = IsDownVal(v);
+    int px = 0, py = 0; float pr = 0;
+    if (GetCoords_orig) GetCoords_orig(0, &px, &py, &pr);
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+    if (down) io.AddMousePosEvent((float)px, (float)py);
+    if (down != wasDown) io.AddMouseButtonEvent(0, down);
+    if (!down && wasDown) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    wasDown = down;
+
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+    BuildUI(W, H);
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // pulihkan state vertex
+    for (int i = 0; i < 8; i++) {
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)ab[i].buf);
+        glVertexAttribPointer((GLuint)i, ab[i].size, (GLenum)ab[i].type, (GLboolean)ab[i].norm, ab[i].stride, ab[i].ptr);
+        if (ab[i].en) glEnableVertexAttribArray((GLuint)i); else glDisableVertexAttribArray((GLuint)i);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevArray);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)prevElem);
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
+static void SwapBuffers_hook() {
+    if (g_menuEnabled && !g_menuFailed && (g_menuReady || InitMenu())) DrawMenuFrame();
+    SwapBuffers_orig();
 }
 
 ON_MOD_PRELOAD() {
@@ -518,10 +897,23 @@ ON_MOD_PRELOAD() {
     LoadConfig();
     aml->Hook(hook_target, (void*)SetEditableMaterials_hook, (void**)&SetEditableMaterials_orig);
     g_ready = true;
+    if (!g_templates.count("custom")) { Template c; c.name = "custom"; c.a = {40, 120, 255}; c.b = {255, 60, 200}; c.c = {60, 220, 160}; c.hasC = true; g_templates["custom"] = c; }
     for (auto& kv : g_templates) if (g_palette.size() < 32) g_palette.push_back(kv.second);
-    if (g_shiftMode == 3 && g_shaderPatchEnabled) {
-        g_shaderOK = InstallShaderHook(hook_target);
-        if (!g_shaderOK) logger->Error("Mode pixel tidak aktif, memakai mode sudut");
+    if (g_shaderPatchEnabled) {
+        bool ok = InstallGotHook(hook_target, 0x845650, 0, (void*)glUseProgram_hook, (void**)&glUseProgram_orig, "glUseProgram")
+               && InstallGotHook(hook_target, 0x8496e0, 0, (void*)glLinkProgram_hook, (void**)&glLinkProgram_orig, "glLinkProgram")
+               && InstallGotHook(hook_target, 0x8497f8, 0, (void*)glShaderSource_hook, (void**)&glShaderSource_orig, "glShaderSource");
+        g_shaderOK = ok;
+        if (!ok) logger->Error("Mode pixel tidak aktif, memakai mode sudut");
+    }
+    if (g_menuEnabled) {
+        GetCoords_orig = (decltype(GetCoords_orig))aml->GetSym(h, "_Z25LIB_PointerGetCoordinatesiPiS_Pf");
+        FindPlayerVehicle_fn = (decltype(FindPlayerVehicle_fn))aml->GetSym(h, "_Z17FindPlayerVehicleib");
+        void* any = hook_target;
+        bool ok = GetCoords_orig
+               && InstallGotHook(any, 0x842fd8, 0x32703c, (void*)GetButton_hook, (void**)&GetButton_orig, "LIB_PointerGetButton")
+               && InstallGotHook(any, 0x83f028, 0x31e2a4, (void*)SwapBuffers_hook, (void**)&SwapBuffers_orig, "OS_ScreenSwapBuffers");
+        if (!ok) { g_menuEnabled = false; logger->Error("Menu in-game tidak aktif (hook gagal)"); }
     }
     logger->Info("Pearlescent aktif. Config: %s", g_iniPath.c_str());
 }
