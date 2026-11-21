@@ -107,6 +107,7 @@ static bool  g_enabled = true;            // master on/off
 struct UiRect { float x0, y0, x1, y1; bool valid; };
 static UiRect g_uiRects[3] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
 static bool  g_autoSave = true;
+static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
 static PresetSlot g_presets[6];
 static uint64_t g_hashVal = 0;
@@ -192,7 +193,7 @@ static void LoadConfig() {
     bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
-    float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY;
+    float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
     char line[256];
@@ -239,6 +240,8 @@ static void LoadConfig() {
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
+            else if (k == "menu_button_alpha") btnAlpha = (float)atof(v.c_str());
+            else if (k == "menu_panel_alpha") panelAlpha = (float)atof(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
         } else if (curPre) {
@@ -263,6 +266,8 @@ static void LoadConfig() {
     g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias;
     g_chamReflect = chamReflect; g_chamFresnel = chamFresnel; g_chamDepth = chamDepth; g_chamFlake = chamFlake; g_chamBright = chamBright; g_shaderPatchEnabled = shaderPatch;
     g_menuEnabled = menuOn; g_menuScale = menuScale; g_btnX = btnX; g_btnY = btnY;
+    g_btnAlpha = btnAlpha < 0.1f ? 0.1f : (btnAlpha > 1.0f ? 1.0f : btnAlpha);
+    g_panelAlpha = panelAlpha < 0.4f ? 0.4f : (panelAlpha > 1.0f ? 1.0f : panelAlpha);
     g_enabled = enabledV; g_autoSave = autoSaveV;
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
@@ -596,7 +601,7 @@ static void SaveConfig() {
     fprintf(f, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
     fprintf(f, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
             g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
-    fprintf(f, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY);
+    fprintf(f, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
     fprintf(f, "\n[cars]\n");
     for (auto& kv : g_carsCfg) fprintf(f, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
     auto cu = g_templates.find("custom");
@@ -782,7 +787,7 @@ static uint64_t SettingsHash() {
     f.v(g_enabled); f.v(g_autoSave); f.v(g_whitelist); f.v(g_shiftMode); f.s(g_tpl.name);
     f.v(g_angleGain); f.v(g_elevGain); f.v(g_partSpread); f.v(g_speed); f.v(g_intensity);
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
-    f.v(g_btnX); f.v(g_btnY);
+    f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
     for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
     auto cu = g_templates.find("custom");
     if (cu != g_templates.end()) { HashRGB(f, cu->second.a); HashRGB(f, cu->second.b); HashRGB(f, cu->second.c); f.v(cu->second.hasC); }
@@ -819,7 +824,7 @@ static int GetButton_hook(int idx, int btn) {
 
 static float g_sc = 1.0f;
 static bool  g_noScroll = false;
-static int   g_tab = 0, g_editSlot = -1, g_presetMode = 0;
+static int   g_tab = 0, g_editSlot = -1, g_pickSlot = -1, g_presetMode = 0;
 static bool  g_hexFresh = false;
 static std::string g_hexBuf, g_toast;
 static double g_toastT = -10.0;
@@ -829,6 +834,29 @@ static const ImVec4 kPanel(0.17f, 0.17f, 0.23f, 1.0f);
 static const ImVec4 kPanelHi(0.23f, 0.23f, 0.31f, 1.0f);
 
 static void Toast(const std::string& t) { g_toast = t; g_toastT = NowSec(); }
+
+// ---- setelan awal ----
+static void ResetEffects() {
+    g_shiftMode = 3;
+    g_chamGain = 1.6f; g_chamFlow = 0.25f; g_chamBias = 0.0f; g_chamDepth = 0.25f;
+    g_chamReflect = 0.22f; g_chamFresnel = 0.5f; g_chamFlake = 0.08f; g_chamBright = 0.9f;
+    g_angleGain = 2.0f; g_elevGain = 1.5f; g_partSpread = 2.5f; g_speed = 0.5f; g_intensity = 1.0f;
+    g_uniVersion++;
+}
+
+static void ResetAll() {
+    ResetEffects();
+    g_whitelist = false; g_carsCfg.clear(); g_needResolve = true;
+    g_enabled = true; g_autoSave = true;
+    g_btnX = 0.44f; g_btnY = 0.02f; g_btnAlpha = 1.0f; g_panelAlpha = 0.97f;
+    Template& cu = g_templates["custom"];
+    cu.name = "custom"; cu.a = {40, 120, 255}; cu.b = {255, 60, 200}; cu.c = {60, 220, 160}; cu.hasC = true; cu.intensity = 1.0f;
+    for (int i = 0; i < 6; i++) g_presets[i] = PresetSlot();
+    auto it = g_templates.find("Purple-Blue-Green");
+    g_tpl = (it != g_templates.end()) ? it->second : cu;
+    g_editSlot = -1; g_pickSlot = -1;
+    g_uniVersion++;
+}
 
 static void SaveRect(int i) {
     ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
@@ -962,6 +990,7 @@ static void ColorRow(int slot, const char* label) {
     cu.name = "custom";
     RGB cur = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
     bool editing = (g_editSlot == slot);
+    bool picking = (g_pickSlot == slot);
     ImGui::PushID(slot);
     ImGui::TextUnformatted(label);
     float sz = ImGui::GetFrameHeight() * 1.5f;
@@ -969,7 +998,7 @@ static void ColorRow(int slot, const char* label) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool tapSw = ImGui::InvisibleButton("##sw", ImVec2(sz, sz)) && !Dragged();
     ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + sz, p.y + sz), C32(cur), 10.0f * g_sc);
-    ImGui::GetWindowDrawList()->AddRect(p, ImVec2(p.x + sz, p.y + sz), IM_COL32(255, 255, 255, 90), 10.0f * g_sc, 0, 2.0f);
+    ImGui::GetWindowDrawList()->AddRect(p, ImVec2(p.x + sz, p.y + sz), picking ? IM_COL32(143, 92, 250, 255) : IM_COL32(255, 255, 255, 90), 10.0f * g_sc, 0, picking ? 4.0f : 2.0f);
     ImGui::SameLine();
     float bw = ImGui::GetFrameHeight() * 2.6f;
     float fw = ImGui::GetContentRegionAvail().x - (bw * 2 + sp * 2);
@@ -978,8 +1007,10 @@ static void ColorRow(int slot, const char* label) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, editing ? kAccent : kPanelHi);
     bool tapField = Btn(shown.c_str(), ImVec2(fw, sz));
     ImGui::PopStyleColor(2);
-    if (tapSw || tapField) {
-        if (editing) g_editSlot = -1; else { g_editSlot = slot; g_hexBuf = HexStr(cur); g_hexFresh = true; }
+    if (tapSw) { if (picking) g_pickSlot = -1; else { g_pickSlot = slot; g_editSlot = -1; } }
+    if (tapField) {
+        if (editing) g_editSlot = -1;
+        else { g_editSlot = slot; g_pickSlot = -1; g_hexBuf = HexStr(cur); g_hexFresh = true; }
     }
     ImGui::SameLine();
     if (Btn("Salin", ImVec2(bw, sz))) Toast(ClipboardSet("#" + HexStr(cur)) ? "Kode warna disalin" : "Clipboard tidak tersedia");
@@ -1018,6 +1049,28 @@ static void ColorRow(int slot, const char* label) {
             if ((g_hexBuf.size() == 3 || g_hexBuf.size() == 6) && ParseHexToken(g_hexBuf, c)) ApplyCustom(slot, c);
             g_editSlot = -1;
         }
+    }
+    if (g_pickSlot == slot) {
+        // picker RGB / HSV (inline, tanpa popup)
+        RGB c0 = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
+        float col[3] = { c0.r / 255.0f, c0.g / 255.0f, c0.b / 255.0f };
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.70f);
+        if (ImGui::ColorPicker3("##pick", col, ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs |
+                                ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_PickerHueBar))
+            ApplyCustom(slot, ToRGB(col));
+        if (ImGui::IsAnyItemActive()) g_noScroll = true;
+        RGB c1 = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
+        int rgb[3] = { c1.r, c1.g, c1.b };
+        static const char* fm[3] = { "R   %d", "G   %d", "B   %d" };
+        bool chg = false;
+        for (int i = 0; i < 3; i++) {
+            ImGui::PushID(100 + i);
+            ImGui::SetNextItemWidth(-1.0f);
+            chg |= ImGui::SliderInt("##rgb", &rgb[i], 0, 255, fm[i]);
+            if (ImGui::IsItemActive()) g_noScroll = true;
+            ImGui::PopID();
+        }
+        if (chg) ApplyCustom(slot, { Clamp255(rgb[0]), Clamp255(rgb[1]), Clamp255(rgb[2]) });
     }
     ImGui::PopID();
     ImGui::Spacing();
@@ -1064,7 +1117,7 @@ static void TabWarna() {
         }
     }
     SectionTitle("MIX MANUAL / KODE WARNA");
-    ImGui::TextWrapped("Ketuk kolom kode untuk mengetik (keypad hex), atau pakai Tempel untuk memasukkan dari clipboard. Format: #RRGGBB, RGB, atau 120,40,200.");
+    ImGui::TextWrapped("Ketuk KOTAK WARNA untuk membuka picker RGB. Ketuk KOLOM KODE untuk mengetik hex (keypad). Tempel/Salin memakai clipboard (#RRGGBB, RGB, atau 120,40,200).");
     ImGui::Spacing();
     ColorRow(0, "Warna A (menghadap kamera)");
     ColorRow(1, "Warna B (tengah)");
@@ -1126,6 +1179,12 @@ static void TabWarna() {
 }
 
 static void TabEfek() {
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.26f, 0.38f, 1.0f));
+        if (Btn("Kembalikan efek ke default", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.4f))) { ResetEffects(); Toast("Efek dikembalikan ke default"); }
+        ImGui::PopStyleColor(2);
+    }
     SectionTitle("MODE");
     static const char* kModes[] = {"Pixel", "Sudut", "Waktu", "Gabungan"};
     static const int kModeVal[] = {3, 0, 1, 2};
@@ -1152,6 +1211,11 @@ static void TabEfek() {
     SliderRow("Beda antar bagian", &g_partSpread, 0.0f, 6.0f);
     SliderRow("Kecepatan (waktu)", &g_speed, 0.0f, 3.0f);
     SliderRow("Intensitas", &g_intensity, 0.0f, 1.0f);
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.26f, 0.38f, 1.0f));
+    if (Btn("Kembalikan efek ke default ", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.4f))) { ResetEffects(); Toast("Efek dikembalikan ke default"); }
+    ImGui::PopStyleColor(2);
 }
 
 static void TabMobil() {
@@ -1198,6 +1262,21 @@ static void TabSistem() {
     SectionTitle("TOMBOL MENU");
     SliderRow("Posisi X", &g_btnX, 0.0f, 0.95f);
     SliderRow("Posisi Y", &g_btnY, 0.0f, 0.9f);
+    SliderRow("Transparansi tombol (kecil = lebih transparan)", &g_btnAlpha, 0.10f, 1.0f);
+    SliderRow("Transparansi panel menu", &g_panelAlpha, 0.40f, 1.0f);
+    SectionTitle("RESET GLOBAL");
+    ImGui::TextWrapped("Mengembalikan SEMUA pengaturan ke setelan awal: efek, mode, warna custom, preset, daftar mobil, posisi dan transparansi tombol.");
+    {
+        static double confirmT = -10.0;
+        bool armed = (NowSec() - confirmT) < 3.0;
+        ImGui::PushStyleColor(ImGuiCol_Button, armed ? ImVec4(0.80f, 0.20f, 0.25f, 1.0f) : ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.26f, 0.32f, 1.0f));
+        if (Btn(armed ? "Ketuk lagi untuk KONFIRMASI reset" : "Kembalikan semua ke setelan awal", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.5f))) {
+            if (armed) { ResetAll(); confirmT = -10.0; Toast("Semua pengaturan dikembalikan ke setelan awal"); }
+            else confirmT = NowSec();
+        }
+        ImGui::PopStyleColor(2);
+    }
     SectionTitle("STATUS");
     ImGui::TextWrapped("Shader per-piksel: %s", g_shaderOK ? "aktif" : "tidak aktif");
     ImGui::TextWrapped("Template: %d | Palet shader: %d", (int)g_templates.size(), (int)g_palette.size());
@@ -1231,11 +1310,13 @@ static void BuildUI(float W, float H) {
         if (ImGui::InvisibleButton("##fab", ImVec2(d, d)) && !Dragged()) g_menuOpen = !g_menuOpen;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 c(p.x + d * 0.5f, p.y + d * 0.5f);
-        dl->AddCircleFilled(c, d * 0.5f, IM_COL32(20, 20, 32, 235));
-        dl->AddCircle(c, d * 0.5f - 2.0f * g_sc, ImGui::GetColorU32(g_menuOpen ? kAccent2 : kAccent), 0, 3.0f * g_sc);
+        float al = g_btnAlpha;
+        ImVec4 rc = g_menuOpen ? kAccent2 : kAccent; rc.w = al;
+        dl->AddCircleFilled(c, d * 0.5f, IM_COL32(20, 20, 32, (int)(235 * al)));
+        dl->AddCircle(c, d * 0.5f - 2.0f * g_sc, ImGui::GetColorU32(rc), 0, 3.0f * g_sc);
         ImVec2 ts = ImGui::CalcTextSize("PC");
-        dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), "PC");
-        dl->AddCircleFilled(ImVec2(c.x + d * 0.34f, c.y - d * 0.34f), d * 0.09f, g_enabled ? IM_COL32(60, 220, 120, 255) : IM_COL32(235, 70, 70, 255));
+        dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(255, 255, 255, (int)(255 * al)), "PC");
+        dl->AddCircleFilled(ImVec2(c.x + d * 0.34f, c.y - d * 0.34f), d * 0.09f, g_enabled ? IM_COL32(60, 220, 120, (int)(255 * al)) : IM_COL32(235, 70, 70, (int)(255 * al)));
         SaveRect(0);
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1246,6 +1327,7 @@ static void BuildUI(float W, float H) {
         float mw = W * 0.64f, mh = H * 0.90f;
         ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(g_panelAlpha);
         ImGui::Begin("##pcmain", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
         SaveRect(1);
