@@ -51,6 +51,51 @@ struct RwRGBA { unsigned char r, g, b, a; };
 
 // ---- state ----
 static std::map<std::string, Template> g_templates;
+
+// ---- slot custom: 8 slot, tiap slot punya 3 warna sendiri (bisa dipakai mobil berbeda) ----
+static std::string g_curCustom = "custom";   // slot custom yang sedang diedit
+static bool IsCustomName(const std::string& n, int* slot = nullptr) {
+    if (n == "custom") { if (slot) *slot = 0; return true; }
+    if (n.size() == 7 && n.compare(0, 6, "custom") == 0 && n[6] >= '2' && n[6] <= '8') { if (slot) *slot = n[6] - '1'; return true; }
+    return false;
+}
+static std::string CustomName(int slot) { return slot <= 0 ? std::string("custom") : "custom" + std::to_string(slot + 1); }
+static const RGB kCustomDef[8][3] = {
+    {{40, 120, 255}, {255, 60, 200}, {60, 220, 160}},
+    {{255, 120, 40}, {200, 40, 160}, {60, 60, 220}},
+    {{30, 200, 120}, {30, 120, 220}, {150, 60, 220}},
+    {{220, 60, 60}, {240, 180, 40}, {60, 200, 200}},
+    {{120, 40, 200}, {40, 200, 220}, {240, 100, 160}},
+    {{20, 20, 60}, {80, 40, 160}, {200, 60, 200}},
+    {{200, 200, 60}, {60, 180, 80}, {40, 100, 200}},
+    {{240, 240, 240}, {160, 140, 230}, {100, 200, 220}},
+};
+static void EnsureCustomSlots() {
+    for (int i = 0; i < 8; i++) {
+        std::string n = CustomName(i);
+        auto it = g_templates.find(n);
+        if (it == g_templates.end()) {
+            Template t; t.name = n; t.a = kCustomDef[i][0]; t.b = kCustomDef[i][1]; t.c = kCustomDef[i][2]; t.hasC = true;
+            g_templates[n] = t;
+        } else {
+            it->second.name = n;
+            if (!it->second.hasC) { it->second.c = it->second.b; it->second.hasC = true; }
+        }
+    }
+}
+static Template& CustomT() {
+    Template& t = g_templates[g_curCustom];
+    t.name = g_curCustom;
+    if (!t.hasC) { t.c = t.b; t.hasC = true; }
+    return t;
+}
+static std::string DisplayName(const std::string& n) {
+    int sl = 0;
+    if (IsCustomName(n, &sl)) return "Custom " + std::to_string(sl + 1);
+    std::string r = n;
+    for (char& ch : r) if (ch == '-') ch = ' ';
+    return r;
+}
 static Template g_tpl;
 static float g_speed = 0.6f, g_intensity = 1.0f;
 static std::string g_iniPath;
@@ -209,7 +254,7 @@ static void LoadConfig() {
             if (sec.rfind("preset:", 0) == 0) { int pn = atoi(sec.c_str() + 7); if (pn >= 1 && pn <= 6) curPre = &pre[pn - 1]; }
             std::string name;
             if (sec.rfind("template:", 0) == 0) name = Trim(sec.substr(9));
-            else if (sec == "custom") name = "custom";
+            else if (IsCustomName(sec)) name = sec;
             if (!name.empty()) { cur = &t[name]; cur->name = name; }
             continue;
         }
@@ -259,6 +304,7 @@ static void LoadConfig() {
     fclose(f);
     if (t.empty()) return;
     g_templates = t;
+    EnsureCustomSlots();
     auto it = g_templates.find(active);
     g_tpl = (it != g_templates.end()) ? it->second : g_templates.begin()->second;
     g_speed = speed; g_intensity = inten;
@@ -407,10 +453,12 @@ static void SetEditableMaterials_hook(void* clump) {
         }
         if (g_shiftMode == 3 && g_shaderOK) {
             // tandai material primary; shader menghitung warna per piksel
-            int idx = PaletteIndex(tp->name);
+            int cslot = 0;
+            bool isCustom = IsCustomName(tp->name, &cslot);
+            int idx = isCustom ? cslot : PaletteIndex(tp->name);
             for (const PrimMat& pm : g_primary) {
                 RwRGBA* c = (RwRGBA*)((char*)pm.mat + sizeof(void*));
-                c->r = 1; c->g = 253; c->b = (unsigned char)(idx * 8);
+                c->r = isCustom ? 5 : 1; c->g = 253; c->b = (unsigned char)(idx * 8);
             }
             return;
         }
@@ -435,9 +483,13 @@ static std::string BuildPaletteFn() {
     for (size_t i = 0; i < g_palette.size(); i++) {
         const Template& tp = g_palette[i];
         s += " if (idx < " + Fl((float)i + 0.5f) + ") return ";
-        if (tp.name == "custom") s += "mix(mix(ChamA,ChamB,u1),ChamC,u2);\n";
-        else if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
+        if (tp.hasC) s += "mix(mix(" + V3(tp.a) + "," + V3(tp.b) + ",u1)," + V3(tp.c) + ",u2);\n";
         else         s += "mix(" + V3(tp.a) + "," + V3(tp.b) + ",us);\n";
+    }
+    for (int k = 0; k < 8; k++) {
+        char b[160];
+        snprintf(b, sizeof b, " if (idx < %d.5) return mix(mix(ChamA%d,ChamB%d,u1),ChamC%d,u2);\n", 100 + k, k, k, k);
+        s += b;
     }
     s += " return vec3(1.0);\n}\n";
     return s;
@@ -451,7 +503,12 @@ static void ReplaceAll(std::string& s, const std::string& a, const std::string& 
 static bool PatchShader(std::string& src) {
     const size_t np = std::string::npos;
     const std::string varyings = "varying mediump float Out_Cham;\nvarying mediump vec3 Out_WN;\nvarying mediump vec3 Out_VV;\n";
-    const std::string uniforms = "uniform mediump vec4 ChamP0;\nuniform mediump vec4 ChamP1;\nuniform mediump vec3 ChamA;\nuniform mediump vec3 ChamB;\nuniform mediump vec3 ChamC;\n";
+    std::string uniforms = "uniform mediump vec4 ChamP0;\nuniform mediump vec4 ChamP1;\n";
+    for (int k = 0; k < 8; k++) {
+        char b[160];
+        snprintf(b, sizeof b, "uniform mediump vec3 ChamA%d;\nuniform mediump vec3 ChamB%d;\nuniform mediump vec3 ChamC%d;\n", k, k, k);
+        uniforms += b;
+    }
     size_t m = src.find("void main()");
     if (m == np) return false;
 
@@ -461,7 +518,7 @@ static bool PatchShader(std::string& src) {
         if (a == np || src.find("WorldNormal") == np) return false;
         std::string expr = "0.0";
         if (src.find("uniform lowp vec4 MaterialDiffuse") != np)
-            expr = "(abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5 && abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : 0.0";
+            expr = "(abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? ((abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : ((abs(MaterialDiffuse.x * 255.0 - 5.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 101.0 : 0.0)) : 0.0";
         src.replace(a, anchor.size(), anchor + "\nOut_WN = WorldNormal; Out_VV = reflVector; Out_Cham = " + expr + ";\n");
         src.insert(m, varyings);
         return true;
@@ -546,18 +603,20 @@ static bool InstallGotHook(void* anySym, uintptr_t slotOff, uintptr_t expectOff,
 // ---------- uniform live untuk shader chameleon ----------
 static void (*glUseProgram_orig)(unsigned) = nullptr;
 static void (*glLinkProgram_orig)(unsigned) = nullptr;
-struct ProgLocs { int p0 = -1, p1 = -1, a = -1, b = -1, c = -1; unsigned ver = 0; bool known = false; };
+struct ProgLocs { int p0 = -1, p1 = -1, ca[8], cb[8], cc[8]; unsigned ver = 0; bool known = false; ProgLocs() { for (int i = 0; i < 8; i++) ca[i] = cb[i] = cc[i] = -1; } };
 static std::map<unsigned, ProgLocs> g_progs;
 
 static void SetChamUniforms(const ProgLocs& L) {
     glUniform4f(L.p0, g_chamGain, g_chamFlow, g_chamBias, g_chamDepth);
     if (L.p1 >= 0) glUniform4f(L.p1, g_chamReflect, g_chamFresnel, g_chamFlake, g_chamBright);
-    RGB a{255, 255, 255}, b = a, c = a;
-    auto it = g_templates.find("custom");
-    if (it != g_templates.end()) { a = it->second.a; b = it->second.b; c = it->second.hasC ? it->second.c : it->second.b; }
-    if (L.a >= 0) glUniform3f(L.a, a.r / 255.0f, a.g / 255.0f, a.b / 255.0f);
-    if (L.b >= 0) glUniform3f(L.b, b.r / 255.0f, b.g / 255.0f, b.b / 255.0f);
-    if (L.c >= 0) glUniform3f(L.c, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+    for (int i = 0; i < 8; i++) {
+        RGB a{255, 255, 255}, b = a, c = a;
+        auto it = g_templates.find(CustomName(i));
+        if (it != g_templates.end()) { a = it->second.a; b = it->second.b; c = it->second.hasC ? it->second.c : it->second.b; }
+        if (L.ca[i] >= 0) glUniform3f(L.ca[i], a.r / 255.0f, a.g / 255.0f, a.b / 255.0f);
+        if (L.cb[i] >= 0) glUniform3f(L.cb[i], b.r / 255.0f, b.g / 255.0f, b.b / 255.0f);
+        if (L.cc[i] >= 0) glUniform3f(L.cc[i], c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+    }
 }
 
 static void glUseProgram_hook(unsigned prog) {
@@ -567,9 +626,12 @@ static void glUseProgram_hook(unsigned prog) {
     if (!L.known) {
         L.p0 = glGetUniformLocation(prog, "ChamP0");
         L.p1 = glGetUniformLocation(prog, "ChamP1");
-        L.a = glGetUniformLocation(prog, "ChamA");
-        L.b = glGetUniformLocation(prog, "ChamB");
-        L.c = glGetUniformLocation(prog, "ChamC");
+        for (int i = 0; i < 8; i++) {
+            char nm[16];
+            snprintf(nm, sizeof nm, "ChamA%d", i); L.ca[i] = glGetUniformLocation(prog, nm);
+            snprintf(nm, sizeof nm, "ChamB%d", i); L.cb[i] = glGetUniformLocation(prog, nm);
+            snprintf(nm, sizeof nm, "ChamC%d", i); L.cc[i] = glGetUniformLocation(prog, nm);
+        }
         L.known = true;
     }
     if (L.p0 < 0 || L.ver == g_uniVersion) return;
@@ -586,7 +648,7 @@ static void glLinkProgram_hook(unsigned prog) {
 static const char* ShiftName(int m) { return m == 1 ? "time" : (m == 2 ? "both" : (m == 3 ? "pixel" : "angle")); }
 
 static void WriteTpl(FILE* f, const Template& t) {
-    if (t.name == "custom") fprintf(f, "\n[custom]\n"); else fprintf(f, "\n[template:%s]\n", t.name.c_str());
+    if (IsCustomName(t.name)) fprintf(f, "\n[%s]\n", t.name.c_str()); else fprintf(f, "\n[template:%s]\n", t.name.c_str());
     fprintf(f, "a=%d,%d,%d\nb=%d,%d,%d\n", t.a.r, t.a.g, t.a.b, t.b.r, t.b.g, t.b.b);
     if (t.hasC) fprintf(f, "c=%d,%d,%d\n", t.c.r, t.c.g, t.c.b);
     if (t.intensity != 1.0f) fprintf(f, "intensity=%.2f\n", t.intensity);
@@ -605,9 +667,8 @@ static void SaveConfig() {
     fprintf(f, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
     fprintf(f, "\n[cars]\n");
     for (auto& kv : g_carsCfg) fprintf(f, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
-    auto cu = g_templates.find("custom");
-    if (cu != g_templates.end()) WriteTpl(f, cu->second);
-    for (auto& kv : g_templates) if (kv.first != "custom") WriteTpl(f, kv.second);
+    for (int i = 0; i < 8; i++) { auto cu = g_templates.find(CustomName(i)); if (cu != g_templates.end()) WriteTpl(f, cu->second); }
+    for (auto& kv : g_templates) if (!IsCustomName(kv.first)) WriteTpl(f, kv.second);
     for (int i = 0; i < 6; i++) {
         if (!g_presets[i].used) continue;
         const PresetSlot& ps = g_presets[i];
@@ -790,8 +851,11 @@ static uint64_t SettingsHash() {
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
     f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
     for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
-    auto cu = g_templates.find("custom");
-    if (cu != g_templates.end()) { HashRGB(f, cu->second.a); HashRGB(f, cu->second.b); HashRGB(f, cu->second.c); f.v(cu->second.hasC); }
+    f.s(g_curCustom);
+    for (int i = 0; i < 8; i++) {
+        auto cu = g_templates.find(CustomName(i));
+        if (cu != g_templates.end()) { HashRGB(f, cu->second.a); HashRGB(f, cu->second.b); HashRGB(f, cu->second.c); f.v(cu->second.hasC); }
+    }
     for (int i = 0; i < 6; i++) { f.v(g_presets[i].used); HashRGB(f, g_presets[i].a); HashRGB(f, g_presets[i].b); HashRGB(f, g_presets[i].c); }
     return f.h;
 }
@@ -851,11 +915,15 @@ static void ResetAll() {
     g_whitelist = false; g_carsCfg.clear(); g_needResolve = true;
     g_enabled = true; g_autoSave = true;
     g_btnX = 0.44f; g_btnY = 0.02f; g_btnAlpha = 1.0f; g_panelAlpha = 0.97f;
-    Template& cu = g_templates["custom"];
-    cu.name = "custom"; cu.a = {40, 120, 255}; cu.b = {255, 60, 200}; cu.c = {60, 220, 160}; cu.hasC = true; cu.intensity = 1.0f;
+    for (int i = 0; i < 8; i++) {
+        std::string n = CustomName(i);
+        Template& cu = g_templates[n];
+        cu.name = n; cu.a = kCustomDef[i][0]; cu.b = kCustomDef[i][1]; cu.c = kCustomDef[i][2]; cu.hasC = true; cu.intensity = 1.0f;
+    }
+    g_curCustom = "custom";
     for (int i = 0; i < 6; i++) g_presets[i] = PresetSlot();
     auto it = g_templates.find("Purple-Blue-Green");
-    g_tpl = (it != g_templates.end()) ? it->second : cu;
+    g_tpl = (it != g_templates.end()) ? it->second : g_templates["custom"];
     g_editSlot = -1; g_pickSlot = -1;
     g_uniVersion++;
 }
@@ -887,7 +955,7 @@ static RGB MixRGB(const RGB& a, const RGB& b, float u) {
 }
 static float Smooth(float x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return x * x * (3.0f - 2.0f * x); }
 static RGB RampAt(const Template& t, float k) {   // sama dengan perhitungan di shader
-    if (t.hasC || t.name == "custom") {
+    if (t.hasC || IsCustomName(t.name)) {
         RGB ab = MixRGB(t.a, t.b, Smooth(k * 2.0f));
         return MixRGB(ab, t.hasC ? t.c : t.b, Smooth(k * 2.0f - 1.0f));
     }
@@ -979,8 +1047,7 @@ static bool TemplateCard(const std::string& title, const Template& t, bool sel, 
 }
 
 static void ApplyCustom(int slot, const RGB& c) {
-    Template& cu = g_templates["custom"];
-    cu.name = "custom";
+    Template& cu = CustomT();
     if (!cu.hasC) { cu.c = cu.b; cu.hasC = true; }
     if (slot == 0) cu.a = c; else if (slot == 1) cu.b = c; else cu.c = c;
     g_tpl = cu;
@@ -988,8 +1055,7 @@ static void ApplyCustom(int slot, const RGB& c) {
 }
 
 static void ColorRow(int slot, const char* label) {
-    Template& cu = g_templates["custom"];
-    cu.name = "custom";
+    Template& cu = CustomT();
     RGB cur = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
     bool editing = (g_editSlot == slot);
     bool picking = (g_pickSlot == slot);
@@ -1107,26 +1173,32 @@ static void TabWarna() {
         DrawRamp(g_tpl, p, ImVec2(p.x + w, p.y + h), 14.0f * g_sc);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + h * 0.4f), ImVec2(p.x + w, p.y + h), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
-        std::string nm = g_tpl.name;
-        for (char& ch : nm) if (ch == '-') ch = ' ';
+        std::string nm = DisplayName(g_tpl.name);
         dl->AddText(ImVec2(p.x + 12.0f * g_sc, p.y + h - ImGui::GetTextLineHeight() - 8.0f * g_sc), IM_COL32(255, 255, 255, 255), nm.c_str());
     }
     SectionTitle("TEMPLATE");
     {
         float cw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, ch = ImGui::GetFrameHeight() * 2.1f;
         std::vector<const Template*> list;
-        auto cu = g_templates.find("custom");
-        if (cu != g_templates.end()) list.push_back(&cu->second);
-        for (auto& kv : g_templates) if (kv.first != "custom") list.push_back(&kv.second);
+        for (int i2 = 0; i2 < 8; i2++) { auto cu = g_templates.find(CustomName(i2)); if (cu != g_templates.end()) list.push_back(&cu->second); }
+        for (auto& kv : g_templates) if (!IsCustomName(kv.first)) list.push_back(&kv.second);
         int idx = 0;
         for (const Template* t : list) {
             if (idx % 2 == 1) ImGui::SameLine();
-            std::string title = (t->name == "custom") ? std::string("Custom (milikmu)") : t->name;
-            if (TemplateCard(title, *t, t->name == g_tpl.name, cw, ch)) g_tpl = *t;
+            std::string title = IsCustomName(t->name) ? DisplayName(t->name) : t->name;
+            if (TemplateCard(title, *t, t->name == g_tpl.name, cw, ch)) { g_tpl = *t; if (IsCustomName(t->name)) g_curCustom = t->name; }
             idx++;
         }
     }
     SectionTitle("MIX MANUAL / KODE WARNA");
+    {
+        ImGui::TextWrapped("Pilih slot custom. Tiap slot menyimpan 3 warna sendiri, jadi bisa dipakai mobil yang berbeda (atur di tab Mobil).");
+        static const char* kSl[] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+        int si = 0; IsCustomName(g_curCustom, &si);
+        if (Segmented("csl", kSl, 8, &si)) { g_curCustom = CustomName(si); g_tpl = CustomT(); g_editSlot = -1; g_pickSlot = -1; g_uniVersion++; }
+        ImGui::Text("Sedang diedit: %s", DisplayName(g_curCustom).c_str());
+        ImGui::Spacing();
+    }
     ImGui::TextWrapped("Ketuk KOTAK WARNA untuk membuka picker RGB. Ketuk KOLOM KODE untuk mengetik hex (keypad). Tempel/Salin memakai clipboard (#RRGGBB, RGB, atau 120,40,200).");
     ImGui::Spacing();
     ColorRow(0, "Warna A (menghadap kamera)");
@@ -1134,7 +1206,7 @@ static void TabWarna() {
     ColorRow(2, "Warna C (tepi)");
     {
         float bw = (ImGui::GetContentRegionAvail().x - sp * 2) / 3.0f, bh = ImGui::GetFrameHeight() * 1.3f;
-        Template& cu = g_templates["custom"];
+        Template& cu = CustomT();
         if (Btn("Salin palet", ImVec2(bw, bh))) {
             RGB c3 = cu.hasC ? cu.c : cu.b;
             Toast(ClipboardSet("#" + HexStr(cu.a) + " #" + HexStr(cu.b) + " #" + HexStr(c3)) ? "Palet disalin" : "Clipboard tidak tersedia");
@@ -1148,7 +1220,7 @@ static void TabWarna() {
         }
         ImGui::SameLine();
         if (Btn("Salin dari aktif", ImVec2(bw, bh))) {
-            if (g_tpl.name != "custom") { Template src = g_tpl; ApplyCustom(0, src.a); ApplyCustom(1, src.b); ApplyCustom(2, src.hasC ? src.c : src.b); g_tpl = g_templates["custom"]; Toast("Template disalin ke custom"); }
+            if (g_tpl.name != g_curCustom) { Template src = g_tpl; ApplyCustom(0, src.a); ApplyCustom(1, src.b); ApplyCustom(2, src.hasC ? src.c : src.b); g_tpl = CustomT(); Toast("Template disalin ke " + DisplayName(g_curCustom)); }
         }
     }
     SectionTitle("SLOT PRESET");
@@ -1175,7 +1247,7 @@ static void TabWarna() {
                 dl->AddText(ImVec2(p.x + 10.0f * g_sc, p.y + ch * 0.5f - ImGui::GetTextLineHeight() * 0.5f), IM_COL32(170, 170, 200, 255), t.c_str());
             }
             if (tap) {
-                Template& cu = g_templates["custom"];
+                Template& cu = CustomT();
                 if (g_presetMode == 1) {
                     ps.used = true; ps.a = cu.a; ps.b = cu.b; ps.c = cu.hasC ? cu.c : cu.b;
                     Toast(std::string("Custom disimpan ke ") + nm);
@@ -1242,6 +1314,30 @@ static void TabMobil() {
         if (Btn("Daftarkan (template aktif)", ImVec2(bw, bh))) { g_carsCfg[std::to_string(cur)] = g_tpl.name; g_needResolve = true; Toast("Mobil didaftarkan"); }
         ImGui::SameLine();
         if (Btn("Hapus dari daftar", ImVec2(bw, bh))) { g_carsCfg.erase(std::to_string(cur)); g_needResolve = true; Toast("Mobil dihapus"); }
+        if (Btn("Warna custom khusus mobil ini", ImVec2(ImGui::GetContentRegionAvail().x, bh))) {
+            auto ex = g_carsCfg.find(std::to_string(cur));
+            if (ex != g_carsCfg.end() && IsCustomName(ex->second)) {
+                g_curCustom = ex->second; g_tpl = CustomT(); g_tab = 0; g_uniVersion++;
+                Toast("Edit warna " + DisplayName(g_curCustom));
+            } else {
+                int freeSlot = -1;
+                for (int i = 0; i < 8 && freeSlot < 0; i++) {
+                    std::string n = CustomName(i); bool used = false;
+                    for (auto& kv : g_carsCfg) if (kv.second == n) used = true;
+                    if (!used) freeSlot = i;
+                }
+                if (freeSlot < 0) Toast("Semua 8 slot custom sudah dipakai mobil lain");
+                else {
+                    std::string n = CustomName(freeSlot);
+                    Template src = g_tpl;
+                    Template& dst = g_templates[n];
+                    dst.name = n; dst.a = src.a; dst.b = src.b; dst.c = src.hasC ? src.c : src.b; dst.hasC = true;
+                    g_carsCfg[std::to_string(cur)] = n; g_needResolve = true;
+                    g_curCustom = n; g_tpl = dst; g_tab = 0; g_uniVersion++;
+                    Toast("Mobil ini memakai " + DisplayName(n) + " - atur warnanya di tab Warna");
+                }
+            }
+        }
     } else {
         ImGui::TextWrapped("Naiki sebuah mobil untuk mendaftarkannya.");
     }
@@ -1253,7 +1349,11 @@ static void TabMobil() {
         if (Btn("X", ImVec2(ImGui::GetFrameHeight() * 1.3f, ImGui::GetFrameHeight() * 1.2f))) del = kv.first;
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        ImGui::Text("%s  ->  %s", kv.first.c_str(), kv.second.c_str());
+        ImGui::Text("%s  ->  %s", kv.first.c_str(), DisplayName(kv.second).c_str());
+        if (IsCustomName(kv.second)) {
+            ImGui::SameLine();
+            if (Btn("Edit", ImVec2(ImGui::GetFrameHeight() * 2.0f, ImGui::GetFrameHeight() * 1.2f))) { g_curCustom = kv.second; g_tpl = CustomT(); g_tab = 0; g_uniVersion++; }
+        }
         ImGui::PopID();
     }
     if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; }
@@ -1579,8 +1679,8 @@ ON_MOD_PRELOAD() {
     LoadConfig();
     aml->Hook(hook_target, (void*)SetEditableMaterials_hook, (void**)&SetEditableMaterials_orig);
     g_ready = true;
-    if (!g_templates.count("custom")) { Template c; c.name = "custom"; c.a = {40, 120, 255}; c.b = {255, 60, 200}; c.c = {60, 220, 160}; c.hasC = true; g_templates["custom"] = c; }
-    for (auto& kv : g_templates) if (g_palette.size() < 32) g_palette.push_back(kv.second);
+    EnsureCustomSlots();
+    for (auto& kv : g_templates) if (!IsCustomName(kv.first) && g_palette.size() < 32) g_palette.push_back(kv.second);
     if (g_shaderPatchEnabled) {
         bool ok = InstallGotHook(hook_target, 0x845650, 0, (void*)glUseProgram_hook, (void**)&glUseProgram_orig, "glUseProgram")
                && InstallGotHook(hook_target, 0x8496e0, 0, (void*)glLinkProgram_hook, (void**)&glLinkProgram_orig, "glLinkProgram")
