@@ -3,6 +3,7 @@
 #include <mod/amlmod.h>
 #include <android/log.h>
 #include <GLES2/gl2.h>
+#include <EGL/egl.h>
 #include <jni.h>
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
@@ -824,6 +825,7 @@ static int GetButton_hook(int idx, int btn) {
 
 static float g_sc = 1.0f;
 static bool  g_noScroll = false;
+static float Gutter() { return 46.0f * g_sc; }   // area kosong di kanan untuk menggeser (scroll)
 static int   g_tab = 0, g_editSlot = -1, g_pickSlot = -1, g_presetMode = 0;
 static bool  g_hexFresh = false;
 static std::string g_hexBuf, g_toast;
@@ -945,7 +947,7 @@ static bool Segmented(const char* id, const char* const* items, int n, int* sel)
 
 static bool SliderRow(const char* label, float* v, float lo, float hi, const char* fmt = "%.2f") {
     ImGui::TextUnformatted(label);
-    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - Gutter());
     ImGui::PushID(label);
     bool ch = ImGui::SliderFloat("##s", v, lo, hi, fmt);
     if (ImGui::IsItemActive()) g_noScroll = true;
@@ -1054,18 +1056,26 @@ static void ColorRow(int slot, const char* label) {
         // picker RGB / HSV (inline, tanpa popup)
         RGB c0 = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
         float col[3] = { c0.r / 255.0f, c0.g / 255.0f, c0.b / 255.0f };
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.70f);
+        float availW = ImGui::GetContentRegionAvail().x;
+        float pickW = availW * 0.62f;
+        if (pickW > availW - Gutter()) pickW = availW - Gutter();
+        ImVec2 pk0 = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemWidth(pickW);
         if (ImGui::ColorPicker3("##pick", col, ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs |
                                 ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_PickerHueBar))
             ApplyCustom(slot, ToRGB(col));
-        if (ImGui::IsAnyItemActive()) g_noScroll = true;
+        ImVec2 pk1 = ImGui::GetCursorScreenPos();
+        {   // scroll hanya dimatikan bila jari menyentuh area picker itu sendiri
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            if (ImGui::IsAnyItemActive() && mp.x >= pk0.x && mp.x <= pk0.x + availW - Gutter() && mp.y >= pk0.y && mp.y <= pk1.y) g_noScroll = true;
+        }
         RGB c1 = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
         int rgb[3] = { c1.r, c1.g, c1.b };
         static const char* fm[3] = { "R   %d", "G   %d", "B   %d" };
         bool chg = false;
         for (int i = 0; i < 3; i++) {
             ImGui::PushID(100 + i);
-            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - Gutter());
             chg |= ImGui::SliderInt("##rgb", &rgb[i], 0, 255, fm[i]);
             if (ImGui::IsItemActive()) g_noScroll = true;
             ImGui::PopID();
@@ -1376,7 +1386,7 @@ static void ApplyModernStyle(float sc) {
     st.WindowRounding = 18.0f; st.ChildRounding = 12.0f; st.FrameRounding = 10.0f; st.GrabRounding = 10.0f;
     st.ScrollbarRounding = 10.0f; st.PopupRounding = 12.0f;
     st.WindowPadding = ImVec2(16, 14); st.FramePadding = ImVec2(12, 8); st.ItemSpacing = ImVec2(10, 10);
-    st.ItemInnerSpacing = ImVec2(8, 6); st.ScrollbarSize = 7.0f; st.GrabMinSize = 22.0f;
+    st.ItemInnerSpacing = ImVec2(8, 6); st.ScrollbarSize = 14.0f; st.GrabMinSize = 22.0f;
     st.WindowBorderSize = 1.0f; st.FrameBorderSize = 0.0f; st.ChildBorderSize = 0.0f;
     st.ScaleAllSizes(sc);
     ImVec4* c = st.Colors;
@@ -1402,12 +1412,26 @@ static void ApplyModernStyle(float sc) {
     c[ImGuiCol_ScrollbarGrabActive] = kAccent2;
 }
 
-static bool InitMenu() {
-    if (g_menuFailed) return false;
+// ukuran layar sebenarnya dari surface EGL (viewport GL di akhir frame gameplay bisa kecil/berbeda)
+static bool WindowSize(int& w, int& h) {
+    EGLDisplay d = eglGetCurrentDisplay();
+    EGLSurface sf = eglGetCurrentSurface(EGL_DRAW);
+    EGLint ww = 0, hh = 0;
+    if (d != EGL_NO_DISPLAY && sf != EGL_NO_SURFACE && eglQuerySurface(d, sf, EGL_WIDTH, &ww) && eglQuerySurface(d, sf, EGL_HEIGHT, &hh) && ww > 200 && hh > 200) {
+        w = (int)ww; h = (int)hh;
+        return true;
+    }
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
-    if (vp[2] < 200 || vp[3] < 200) return false;
-    float sc = g_menuScale > 0.0f ? g_menuScale : (float)vp[3] / 480.0f;
+    if (vp[2] > 200 && vp[3] > 200) { w = vp[2]; h = vp[3]; return true; }
+    return false;
+}
+
+static bool InitMenu() {
+    if (g_menuFailed) return false;
+    int ww = 0, hh = 0;
+    if (!WindowSize(ww, hh)) return false;
+    float sc = g_menuScale > 0.0f ? g_menuScale : (float)hh / 480.0f;
     if (sc < 1.0f) sc = 1.0f;
     g_sc = sc;
     ImGui::CreateContext();
@@ -1425,17 +1449,33 @@ static bool InitMenu() {
     ApplyModernStyle(sc);
     if (!ImGui_ImplOpenGL3_Init("#version 100")) { g_menuFailed = true; logger->Error("Init ImGui gagal"); return false; }
     g_menuReady = true;
-    logger->Info("Menu ImGui siap (skala %.2f, layar %dx%d, font %s)", sc, vp[2], vp[3], fontOk ? "sistem" : "bawaan");
+    logger->Info("Menu ImGui siap (skala %.2f, layar %dx%d, font %s)", sc, ww, hh, fontOk ? "sistem" : "bawaan");
     return true;
 }
 
 struct AttribBackup { GLint en, size, type, norm, stride, buf; void* ptr; };
 
 static void DrawMenuFrame() {
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
-    if (vp[2] < 200 || vp[3] < 200) return;
-    float W = (float)vp[2], H = (float)vp[3];
+    int ww = 0, hh = 0;
+    if (!WindowSize(ww, hh)) return;
+    float W = (float)ww, H = (float)hh;
+
+    // diagnostik: catat state GL pada beberapa frame pertama dan berkala
+    static int frames = 0, logs = 0;
+    if ((frames < 4 || frames % 900 == 0) && logs < 14) {
+        GLint vpd[4] = {0, 0, 0, 0}, fbo = 0; GLboolean cm[4] = {1, 1, 1, 1};
+        glGetIntegerv(GL_VIEWPORT, vpd); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo); glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+        logger->Info("frame=%d layar=%dx%d viewport=%d,%d,%d,%d fbo=%d colormask=%d%d%d%d", frames, ww, hh, vpd[2 - 2], vpd[1], vpd[2], vpd[3], fbo, cm[0], cm[1], cm[2], cm[3]);
+        logs++;
+    }
+    frames++;
+
+    // normalkan state yang mungkin ditinggalkan game saat gameplay
+    GLint prevFbo = 0; GLboolean prevMask[4] = {1, 1, 1, 1};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetBooleanv(GL_COLOR_WRITEMASK, prevMask);
+    if (prevFbo != 0) glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     // simpan state vertex yang tidak dipulihkan backend ImGui
     GLint prevArray = 0, prevElem = 0;
@@ -1497,6 +1537,8 @@ static void DrawMenuFrame() {
     }
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevArray);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)prevElem);
+    glColorMask(prevMask[0], prevMask[1], prevMask[2], prevMask[3]);
+    if (prevFbo != 0) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
     while (glGetError() != GL_NO_ERROR) {}
 }
 
