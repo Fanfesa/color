@@ -3,6 +3,7 @@
 #include <mod/amlmod.h>
 #include <android/log.h>
 #include <GLES2/gl2.h>
+#include <jni.h>
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include <cstdarg>
@@ -104,7 +105,13 @@ static float g_menuScale = 0.0f;          // 0 = otomatis
 static float g_btnX = 0.44f, g_btnY = 0.02f;
 static bool  g_enabled = true;            // master on/off
 struct UiRect { float x0, y0, x1, y1; bool valid; };
-static UiRect g_uiRects[2] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
+static UiRect g_uiRects[3] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
+static bool  g_autoSave = true;
+struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
+static PresetSlot g_presets[6];
+static uint64_t g_hashVal = 0;
+static bool g_hashInit = false, g_dirty = false;
+static double g_dirtyT = 0;
 static bool g_latch[2] = {false, false}, g_prevDown[2] = {false, false};
 static int  (*GetButton_orig)(int, int) = nullptr;
 static int  (*GetCoords_orig)(int, int*, int*, float*) = nullptr;
@@ -182,7 +189,9 @@ static void LoadConfig() {
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
-    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled;
+    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave;
+    PresetSlot pre[6];
+    PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY;
     std::map<std::string, std::string> cars;
     Template* cur = nullptr;
@@ -194,6 +203,8 @@ static void LoadConfig() {
             size_t e = s.find(']');
             sec = s.substr(1, e == std::string::npos ? std::string::npos : e - 1);
             cur = nullptr;
+            curPre = nullptr;
+            if (sec.rfind("preset:", 0) == 0) { int pn = atoi(sec.c_str() + 7); if (pn >= 1 && pn <= 6) curPre = &pre[pn - 1]; }
             std::string name;
             if (sec.rfind("template:", 0) == 0) name = Trim(sec.substr(9));
             else if (sec == "custom") name = "custom";
@@ -223,11 +234,17 @@ static void LoadConfig() {
             else if (k == "cham_brightness") chamBright = (float)atof(v.c_str());
             else if (k == "shader_patch") shaderPatch = (atoi(v.c_str()) != 0);
             else if (k == "menu") menuOn = (atoi(v.c_str()) != 0);
+            else if (k == "enabled") enabledV = (atoi(v.c_str()) != 0);
+            else if (k == "autosave") autoSaveV = (atoi(v.c_str()) != 0);
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
         } else if (sec == "cars") {
             cars[k] = v;
+        } else if (curPre) {
+            if (k == "a") { ParseRGB(v, curPre->a); curPre->used = true; }
+            else if (k == "b") ParseRGB(v, curPre->b);
+            else if (k == "c") ParseRGB(v, curPre->c);
         } else if (cur) {
             if (k == "a") ParseRGB(v, cur->a);
             else if (k == "b") ParseRGB(v, cur->b);
@@ -246,6 +263,9 @@ static void LoadConfig() {
     g_chamGain = chamGain; g_chamFlow = chamFlow; g_chamBias = chamBias;
     g_chamReflect = chamReflect; g_chamFresnel = chamFresnel; g_chamDepth = chamDepth; g_chamFlake = chamFlake; g_chamBright = chamBright; g_shaderPatchEnabled = shaderPatch;
     g_menuEnabled = menuOn; g_menuScale = menuScale; g_btnX = btnX; g_btnY = btnY;
+    g_enabled = enabledV; g_autoSave = autoSaveV;
+    for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
+    g_hashInit = false;
     g_uniVersion++;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
@@ -570,6 +590,7 @@ static void SaveConfig() {
     FILE* f = fopen(g_iniPath.c_str(), "w");
     if (!f) { logger->Error("Gagal menyimpan %s", g_iniPath.c_str()); return; }
     fprintf(f, "; Pearlescent Colors - disimpan dari menu in-game\n[settings]\n");
+    fprintf(f, "enabled=%d\nautosave=%d\n", g_enabled ? 1 : 0, g_autoSave ? 1 : 0);
     fprintf(f, "mode=%s\nactive=%s\nshift_mode=%s\n", g_whitelist ? "whitelist" : "all", g_tpl.name.c_str(), ShiftName(g_shiftMode));
     fprintf(f, "angle_gain=%.2f\nelev_gain=%.2f\npart_spread=%.2f\nspeed=%.2f\nintensity=%.2f\n", g_angleGain, g_elevGain, g_partSpread, g_speed, g_intensity);
     fprintf(f, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
@@ -581,9 +602,192 @@ static void SaveConfig() {
     auto cu = g_templates.find("custom");
     if (cu != g_templates.end()) WriteTpl(f, cu->second);
     for (auto& kv : g_templates) if (kv.first != "custom") WriteTpl(f, kv.second);
+    for (int i = 0; i < 6; i++) {
+        if (!g_presets[i].used) continue;
+        const PresetSlot& ps = g_presets[i];
+        fprintf(f, "\n[preset:%d]\na=%d,%d,%d\nb=%d,%d,%d\nc=%d,%d,%d\n", i + 1, ps.a.r, ps.a.g, ps.a.b, ps.b.r, ps.b.g, ps.b.b, ps.c.r, ps.c.g, ps.c.b);
+    }
     fclose(f);
     struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
-    logger->Info("Config disimpan dari menu");
+    logger->Info("Config disimpan");
+}
+
+// ================= clipboard (JNI) =================
+typedef jint (*GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+static JavaVM* g_jvm = nullptr;
+
+static JNIEnv* JEnv() {
+    if (!g_jvm) {
+        GetCreatedJavaVMs_t fn = nullptr;
+        const char* libs[] = {"libnativehelper.so", "libart.so", nullptr};
+        for (int i = 0; libs[i] && !fn; i++) {
+            void* h = dlopen(libs[i], RTLD_NOW);
+            if (h) fn = (GetCreatedJavaVMs_t)dlsym(h, "JNI_GetCreatedJavaVMs");
+        }
+        if (!fn) fn = (GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+        JavaVM* vm = nullptr; jsize n = 0;
+        if (fn && fn(&vm, 1, &n) == JNI_OK && n > 0) g_jvm = vm;
+    }
+    if (!g_jvm) return nullptr;
+    JNIEnv* env = nullptr;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK) return env;
+    if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) return env;
+    return nullptr;
+}
+
+static bool JFail(JNIEnv* e) { if (e->ExceptionCheck()) { e->ExceptionClear(); return true; } return false; }
+
+static jobject ClipMgr(JNIEnv* env) {
+    jclass at = env->FindClass("android/app/ActivityThread");
+    if (!at || JFail(env)) return nullptr;
+    jmethodID cur = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
+    if (!cur || JFail(env)) return nullptr;
+    jobject app = env->CallStaticObjectMethod(at, cur);
+    if (!app || JFail(env)) return nullptr;
+    jclass ctx = env->FindClass("android/content/Context");
+    jmethodID gss = env->GetMethodID(ctx, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (!gss || JFail(env)) return nullptr;
+    jobject cm = env->CallObjectMethod(app, gss, env->NewStringUTF("clipboard"));
+    if (!cm || JFail(env)) return nullptr;
+    return cm;
+}
+
+static std::string ClipboardGet() {
+    JNIEnv* env = JEnv();
+    if (!env) return "";
+    env->PushLocalFrame(64);
+    std::string r;
+    do {
+        jobject cm = ClipMgr(env);
+        if (!cm) break;
+        jclass cmc = env->FindClass("android/content/ClipboardManager");
+        jmethodID gpc = env->GetMethodID(cmc, "getPrimaryClip", "()Landroid/content/ClipData;");
+        if (!gpc || JFail(env)) break;
+        jobject clip = env->CallObjectMethod(cm, gpc);
+        if (!clip || JFail(env)) break;
+        jclass cdc = env->FindClass("android/content/ClipData");
+        jmethodID gic = env->GetMethodID(cdc, "getItemCount", "()I");
+        jmethodID gia = env->GetMethodID(cdc, "getItemAt", "(I)Landroid/content/ClipData$Item;");
+        if (!gic || !gia || JFail(env)) break;
+        if (env->CallIntMethod(clip, gic) < 1) break;
+        jobject item = env->CallObjectMethod(clip, gia, 0);
+        if (!item || JFail(env)) break;
+        jclass itc = env->FindClass("android/content/ClipData$Item");
+        jmethodID gt = env->GetMethodID(itc, "getText", "()Ljava/lang/CharSequence;");
+        if (!gt || JFail(env)) break;
+        jobject cs = env->CallObjectMethod(item, gt);
+        if (!cs || JFail(env)) break;
+        jclass csc = env->FindClass("java/lang/CharSequence");
+        jmethodID ts = env->GetMethodID(csc, "toString", "()Ljava/lang/String;");
+        jstring js = (jstring)env->CallObjectMethod(cs, ts);
+        if (!js || JFail(env)) break;
+        const char* u = env->GetStringUTFChars(js, nullptr);
+        if (u) { r = u; env->ReleaseStringUTFChars(js, u); }
+    } while (false);
+    JFail(env);
+    env->PopLocalFrame(nullptr);
+    return r;
+}
+
+static bool ClipboardSet(const std::string& text) {
+    JNIEnv* env = JEnv();
+    if (!env) return false;
+    env->PushLocalFrame(64);
+    bool ok = false;
+    do {
+        jobject cm = ClipMgr(env);
+        if (!cm) break;
+        jclass cd = env->FindClass("android/content/ClipData");
+        jmethodID np = env->GetStaticMethodID(cd, "newPlainText", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;");
+        if (!np || JFail(env)) break;
+        jobject clip = env->CallStaticObjectMethod(cd, np, env->NewStringUTF("chameleon"), env->NewStringUTF(text.c_str()));
+        if (!clip || JFail(env)) break;
+        jclass cmc = env->FindClass("android/content/ClipboardManager");
+        jmethodID spc = env->GetMethodID(cmc, "setPrimaryClip", "(Landroid/content/ClipData;)V");
+        if (!spc || JFail(env)) break;
+        env->CallVoidMethod(cm, spc, clip);
+        if (JFail(env)) break;
+        ok = true;
+    } while (false);
+    JFail(env);
+    env->PopLocalFrame(nullptr);
+    return ok;
+}
+
+// ================= parsing kode warna =================
+static std::string Trimmed(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+
+static std::string HexStr(const RGB& c) { char b[16]; snprintf(b, sizeof b, "%02X%02X%02X", c.r, c.g, c.b); return b; }
+
+static bool ParseHexToken(std::string s, RGB& o) {
+    if (!s.empty() && s[0] == '#') s.erase(0, 1);
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s.erase(0, 2);
+    if (s.empty()) return false;
+    for (char ch : s) if (!isxdigit((unsigned char)ch)) return false;
+    if (s.size() == 3) { std::string e; for (char ch : s) { e += ch; e += ch; } s = e; }
+    if (s.size() == 8) s = s.substr(0, 6);
+    if (s.size() != 6) return false;
+    unsigned v = (unsigned)strtoul(s.c_str(), nullptr, 16);
+    o = { (int)((v >> 16) & 255), (int)((v >> 8) & 255), (int)(v & 255) };
+    return true;
+}
+
+static bool ParseColorText(const std::string& text, RGB& o) {
+    std::string t = Trimmed(text);
+    size_t nl = t.find_first_of("\r\n");
+    if (nl != std::string::npos) t = Trimmed(t.substr(0, nl));
+    if (t.empty()) return false;
+    if (t.find(',') != std::string::npos || t.find('(') != std::string::npos) {
+        int r = 0, g = 0, b = 0;
+        if (sscanf(t.c_str(), "%*[^0-9]%d%*[^0-9]%d%*[^0-9]%d", &r, &g, &b) == 3 ||
+            sscanf(t.c_str(), "%d%*[^0-9]%d%*[^0-9]%d", &r, &g, &b) == 3) {
+            o = { Clamp255(r), Clamp255(g), Clamp255(b) };
+            return true;
+        }
+        return false;
+    }
+    return ParseHexToken(t, o);
+}
+
+static int ParsePalette(const std::string& text, RGB out[3]) {
+    std::vector<std::string> toks;
+    std::string cur;
+    for (char ch : text) {
+        if (isspace((unsigned char)ch) || ch == ';' || ch == '|') { if (!cur.empty()) { toks.push_back(cur); cur.clear(); } }
+        else cur += ch;
+    }
+    if (!cur.empty()) toks.push_back(cur);
+    int n = 0;
+    for (const std::string& tk : toks) {
+        RGB c;
+        if (n < 3 && ParseHexToken(tk, c)) out[n++] = c; else return 0;
+    }
+    return n;
+}
+
+// ================= auto-save =================
+struct Fnv {
+    uint64_t h = 1469598103934665603ULL;
+    void b(const void* p, size_t n) { const unsigned char* c = (const unsigned char*)p; for (size_t i = 0; i < n; i++) { h ^= c[i]; h *= 1099511628211ULL; } }
+    template <class T> void v(const T& x) { b(&x, sizeof x); }
+    void s(const std::string& x) { b(x.data(), x.size()); b("|", 1); }
+};
+static void HashRGB(Fnv& f, const RGB& c) { f.v(c.r); f.v(c.g); f.v(c.b); }
+
+static uint64_t SettingsHash() {
+    Fnv f;
+    f.v(g_enabled); f.v(g_autoSave); f.v(g_whitelist); f.v(g_shiftMode); f.s(g_tpl.name);
+    f.v(g_angleGain); f.v(g_elevGain); f.v(g_partSpread); f.v(g_speed); f.v(g_intensity);
+    f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
+    f.v(g_btnX); f.v(g_btnY);
+    for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
+    auto cu = g_templates.find("custom");
+    if (cu != g_templates.end()) { HashRGB(f, cu->second.a); HashRGB(f, cu->second.b); HashRGB(f, cu->second.c); f.v(cu->second.hasC); }
+    for (int i = 0; i < 6; i++) { f.v(g_presets[i].used); HashRGB(f, g_presets[i].a); HashRGB(f, g_presets[i].b); HashRGB(f, g_presets[i].c); }
+    return f.h;
 }
 
 // ================= menu in-game (ImGui) =================
@@ -613,18 +817,210 @@ static int GetButton_hook(int idx, int btn) {
     return g_latch[idx] ? 0 : v;
 }
 
+static float g_sc = 1.0f;
+static bool  g_noScroll = false;
+static int   g_tab = 0, g_editSlot = -1, g_presetMode = 0;
+static bool  g_hexFresh = false;
+static std::string g_hexBuf, g_toast;
+static double g_toastT = -10.0;
+static const ImVec4 kAccent(0.56f, 0.36f, 0.98f, 1.0f);
+static const ImVec4 kAccent2(0.16f, 0.74f, 0.96f, 1.0f);
+static const ImVec4 kPanel(0.17f, 0.17f, 0.23f, 1.0f);
+static const ImVec4 kPanelHi(0.23f, 0.23f, 0.31f, 1.0f);
+
+static void Toast(const std::string& t) { g_toast = t; g_toastT = NowSec(); }
+
 static void SaveRect(int i) {
     ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
     g_uiRects[i] = { p.x, p.y, p.x + sz.x, p.y + sz.y, true };
 }
 
+static bool Dragged() {
+    float lim = 10.0f * g_sc;
+    return ImGui::GetIO().MouseDragMaxDistanceSqr[0] > lim * lim;
+}
+static bool Btn(const char* label, const ImVec2& size = ImVec2(0, 0)) { bool r = ImGui::Button(label, size); return r && !Dragged(); }
+
 static void TouchScroll() {
-    if (ImGui::IsWindowFocused() && ImGui::IsMouseDragging(0, 6.0f) && !ImGui::IsAnyItemActive())
+    if (g_noScroll) return;
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) && ImGui::IsMouseDragging(0, 8.0f * g_sc))
         ImGui::SetScrollY(ImGui::GetScrollY() - ImGui::GetIO().MouseDelta.y);
 }
 
 static RGB ToRGB(const float* c) {
     return { Clamp255((int)(c[0] * 255.0f + 0.5f)), Clamp255((int)(c[1] * 255.0f + 0.5f)), Clamp255((int)(c[2] * 255.0f + 0.5f)) };
+}
+
+static ImU32 C32(const RGB& c, int a = 255) { return IM_COL32(c.r, c.g, c.b, a); }
+static RGB MixRGB(const RGB& a, const RGB& b, float u) {
+    return { Clamp255((int)(a.r + (b.r - a.r) * u)), Clamp255((int)(a.g + (b.g - a.g) * u)), Clamp255((int)(a.b + (b.b - a.b) * u)) };
+}
+static float Smooth(float x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return x * x * (3.0f - 2.0f * x); }
+static RGB RampAt(const Template& t, float k) {   // sama dengan perhitungan di shader
+    if (t.hasC || t.name == "custom") {
+        RGB ab = MixRGB(t.a, t.b, Smooth(k * 2.0f));
+        return MixRGB(ab, t.hasC ? t.c : t.b, Smooth(k * 2.0f - 1.0f));
+    }
+    return MixRGB(t.a, t.b, Smooth(k));
+}
+static void DrawRamp(const Template& t, const ImVec2& p0, const ImVec2& p1, float rounding) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const int N = 36;
+    float w = p1.x - p0.x;
+    for (int i = 0; i < N; i++) {
+        float x0 = p0.x + w * i / N, x1 = p0.x + w * (i + 1) / N;
+        ImDrawFlags fl = (i == 0) ? ImDrawFlags_RoundCornersLeft : (i == N - 1 ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersNone);
+        float r = (i == 0 || i == N - 1) ? rounding : 0.0f;
+        dl->AddRectFilled(ImVec2(x0, p0.y), ImVec2(i == N - 1 ? x1 : x1 + 1.0f, p1.y), C32(RampAt(t, (i + 0.5f) / N)), r, fl);
+    }
+}
+
+static bool Toggle(const char* id, bool* v) {
+    float h = ImGui::GetFrameHeight() * 0.95f, w = h * 1.8f;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h)) && !Dragged();
+    if (pressed) *v = !*v;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), *v ? ImGui::GetColorU32(kAccent) : IM_COL32(72, 72, 92, 255), h * 0.5f);
+    dl->AddCircleFilled(ImVec2(p.x + (*v ? w - h * 0.5f : h * 0.5f), p.y + h * 0.5f), h * 0.38f, IM_COL32(255, 255, 255, 255));
+    return pressed;
+}
+
+static bool ToggleRow(const char* label, bool* v) {
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    float tw = ImGui::GetFrameHeight() * 0.95f * 1.8f;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - tw);
+    ImGui::PushID(label);
+    bool r = Toggle("##t", v);
+    ImGui::PopID();
+    return r;
+}
+
+static bool Segmented(const char* id, const char* const* items, int n, int* sel) {
+    bool changed = false;
+    float avail = ImGui::GetContentRegionAvail().x, sp = ImGui::GetStyle().ItemSpacing.x;
+    float w = (avail - sp * (n - 1)) / n;
+    ImGui::PushID(id);
+    for (int i = 0; i < n; i++) {
+        if (i) ImGui::SameLine();
+        bool on = (*sel == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? kAccent : kPanel);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? kAccent : kPanelHi);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccent2);
+        if (Btn(items[i], ImVec2(w, ImGui::GetFrameHeight() * 1.2f)) && !on) { *sel = i; changed = true; }
+        ImGui::PopStyleColor(3);
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+static bool SliderRow(const char* label, float* v, float lo, float hi, const char* fmt = "%.2f") {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::PushID(label);
+    bool ch = ImGui::SliderFloat("##s", v, lo, hi, fmt);
+    if (ImGui::IsItemActive()) g_noScroll = true;
+    ImGui::PopID();
+    return ch;
+}
+
+static void SectionTitle(const char* t) {
+    ImGui::Spacing();
+    ImGui::TextColored(kAccent2, "%s", t);
+    ImGui::Separator();
+    ImGui::Spacing();
+}
+
+static bool TemplateCard(const std::string& title, const Template& t, bool sel, float w, float h) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool tap = ImGui::InvisibleButton(title.c_str(), ImVec2(w, h)) && !Dragged();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float r = 12.0f * g_sc;
+    DrawRamp(t, p, ImVec2(p.x + w, p.y + h), r);
+    dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + h * 0.5f), ImVec2(p.x + w, p.y + h), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 190), IM_COL32(0, 0, 0, 190));
+    std::string shown = title;
+    for (char& ch : shown) if (ch == '-') ch = ' ';
+    dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);
+    dl->AddText(ImVec2(p.x + 10.0f * g_sc, p.y + h - ImGui::GetTextLineHeight() - 6.0f * g_sc), IM_COL32(255, 255, 255, 255), shown.c_str());
+    dl->PopClipRect();
+    if (sel) dl->AddRect(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 255), r, 0, 3.0f * g_sc);
+    return tap;
+}
+
+static void ApplyCustom(int slot, const RGB& c) {
+    Template& cu = g_templates["custom"];
+    cu.name = "custom";
+    if (!cu.hasC) { cu.c = cu.b; cu.hasC = true; }
+    if (slot == 0) cu.a = c; else if (slot == 1) cu.b = c; else cu.c = c;
+    g_tpl = cu;
+    g_uniVersion++;
+}
+
+static void ColorRow(int slot, const char* label) {
+    Template& cu = g_templates["custom"];
+    cu.name = "custom";
+    RGB cur = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
+    bool editing = (g_editSlot == slot);
+    ImGui::PushID(slot);
+    ImGui::TextUnformatted(label);
+    float sz = ImGui::GetFrameHeight() * 1.5f;
+    float sp = ImGui::GetStyle().ItemSpacing.x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool tapSw = ImGui::InvisibleButton("##sw", ImVec2(sz, sz)) && !Dragged();
+    ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + sz, p.y + sz), C32(cur), 10.0f * g_sc);
+    ImGui::GetWindowDrawList()->AddRect(p, ImVec2(p.x + sz, p.y + sz), IM_COL32(255, 255, 255, 90), 10.0f * g_sc, 0, 2.0f);
+    ImGui::SameLine();
+    float bw = ImGui::GetFrameHeight() * 2.6f;
+    float fw = ImGui::GetContentRegionAvail().x - (bw * 2 + sp * 2);
+    std::string shown = editing ? ("#" + g_hexBuf + std::string(g_hexBuf.size() < 6 ? 6 - g_hexBuf.size() : 0, '_')) : ("#" + HexStr(cur));
+    ImGui::PushStyleColor(ImGuiCol_Button, editing ? kAccent : kPanel);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, editing ? kAccent : kPanelHi);
+    bool tapField = Btn(shown.c_str(), ImVec2(fw, sz));
+    ImGui::PopStyleColor(2);
+    if (tapSw || tapField) {
+        if (editing) g_editSlot = -1; else { g_editSlot = slot; g_hexBuf = HexStr(cur); g_hexFresh = true; }
+    }
+    ImGui::SameLine();
+    if (Btn("Salin", ImVec2(bw, sz))) Toast(ClipboardSet("#" + HexStr(cur)) ? "Kode warna disalin" : "Clipboard tidak tersedia");
+    ImGui::SameLine();
+    if (Btn("Tempel", ImVec2(bw, sz))) {
+        RGB c;
+        if (ParseColorText(ClipboardGet(), c)) { ApplyCustom(slot, c); Toast("Warna ditempel"); }
+        else Toast("Clipboard kosong / kode tidak valid");
+    }
+    if (editing) {
+        static const char* keys = "0123456789ABCDEF";
+        float kw = (ImGui::GetContentRegionAvail().x - sp * 7) / 8.0f, kh = ImGui::GetFrameHeight() * 1.35f;
+        for (int i = 0; i < 16; i++) {
+            if (i % 8) ImGui::SameLine();
+            char lb[2] = { keys[i], 0 };
+            if (Btn(lb, ImVec2(kw, kh))) {
+                if (g_hexFresh) { g_hexBuf.clear(); g_hexFresh = false; }
+                if (g_hexBuf.size() < 6) g_hexBuf += lb;
+                RGB c;
+                if (g_hexBuf.size() == 6 && ParseHexToken(g_hexBuf, c)) ApplyCustom(slot, c);
+            }
+        }
+        float kw4 = (ImGui::GetContentRegionAvail().x - sp * 3) / 4.0f;
+        if (Btn("Hapus", ImVec2(kw4, kh))) { if (g_hexFresh) { g_hexBuf.clear(); g_hexFresh = false; } else if (!g_hexBuf.empty()) g_hexBuf.pop_back(); }
+        ImGui::SameLine();
+        if (Btn("Bersih", ImVec2(kw4, kh))) { g_hexBuf.clear(); g_hexFresh = false; }
+        ImGui::SameLine();
+        if (Btn("Tempel kode", ImVec2(kw4, kh))) {
+            RGB c;
+            if (ParseColorText(ClipboardGet(), c)) { ApplyCustom(slot, c); g_hexBuf = HexStr(c); g_hexFresh = true; Toast("Warna ditempel"); }
+            else Toast("Clipboard kosong / kode tidak valid");
+        }
+        ImGui::SameLine();
+        if (Btn("OK", ImVec2(kw4, kh))) {
+            RGB c;
+            if ((g_hexBuf.size() == 3 || g_hexBuf.size() == 6) && ParseHexToken(g_hexBuf, c)) ApplyCustom(slot, c);
+            g_editSlot = -1;
+        }
+    }
+    ImGui::PopID();
+    ImGui::Spacing();
 }
 
 static int CurrentVehicleModel() {
@@ -638,140 +1034,290 @@ static int CurrentVehicleModel() {
     return (id >= 0 && id < 20000) ? id : -1;
 }
 
-static void BuildUI(float W, float H) {
-    const ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings;
-    ImGui::SetNextWindowPos(ImVec2(W * g_btnX, H * g_btnY), ImGuiCond_Always);
-    ImGui::Begin("##pcbtn", nullptr, fl);
-    if (ImGui::Button(g_menuOpen ? "PC  X" : "PC")) g_menuOpen = !g_menuOpen;
-    SaveRect(0);
-    ImGui::End();
-    g_uiRects[1].valid = false;
-    if (!g_menuOpen) return;
-
-    ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(W * 0.66f, H * 0.88f), ImGuiCond_Always);
-    ImGui::Begin("Pearlescent Chameleon", &g_menuOpen,
-                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
-    SaveRect(1);
-
-    ImGui::Checkbox("Aktifkan efek", &g_enabled);
-    ImGui::SameLine();
-    if (ImGui::Button("Simpan")) SaveConfig();
-    ImGui::SameLine();
-    if (ImGui::Button("Muat ulang")) { LoadConfig(); g_uniVersion++; }
-    ImGui::TextWrapped("Template aktif: %s | Shader per-piksel: %s", g_tpl.name.c_str(), g_shaderOK ? "aktif" : "tidak aktif");
-    ImGui::Separator();
-
-    if (ImGui::CollapsingHeader("Mode & target", ImGuiTreeNodeFlags_DefaultOpen)) {
-        static const char* kModes[] = {"Pixel (shader)", "Sudut kamera", "Waktu", "Gabungan"};
-        static const int kModeVal[] = {3, 0, 1, 2};
-        int mi = 0;
-        for (int i = 0; i < 4; i++) if (kModeVal[i] == g_shiftMode) mi = i;
-        if (ImGui::Combo("Mode", &mi, kModes, 4)) g_shiftMode = kModeVal[mi];
-        if (g_shiftMode == 3 && !g_shaderOK) ImGui::TextWrapped("Pixel belum aktif (shader_patch=0 atau hook gagal), dipakai mode sudut.");
-        static const char* kTg[] = {"Semua mobil", "Hanya mobil terdaftar"};
-        int tg = g_whitelist ? 1 : 0;
-        if (ImGui::Combo("Target", &tg, kTg, 2)) g_whitelist = (tg == 1);
+static void TabWarna() {
+    float sp = ImGui::GetStyle().ItemSpacing.x;
+    // pratinjau template aktif
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetFrameHeight() * 2.2f;
+        ImGui::Dummy(ImVec2(w, h));
+        DrawRamp(g_tpl, p, ImVec2(p.x + w, p.y + h), 14.0f * g_sc);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + h * 0.4f), ImVec2(p.x + w, p.y + h), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+        std::string nm = g_tpl.name;
+        for (char& ch : nm) if (ch == '-') ch = ' ';
+        dl->AddText(ImVec2(p.x + 12.0f * g_sc, p.y + h - ImGui::GetTextLineHeight() - 8.0f * g_sc), IM_COL32(255, 255, 255, 255), nm.c_str());
     }
-
-    if (ImGui::CollapsingHeader("Template warna", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::BeginChild("tpllist", ImVec2(0, H * 0.30f), true);
-        for (auto& kv : g_templates) {
-            const Template& t = kv.second;
-            ImGui::PushID(kv.first.c_str());
-            float sz = ImGui::GetFrameHeight();
-            ImGui::ColorButton("##a", ImVec4(t.a.r / 255.0f, t.a.g / 255.0f, t.a.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
-            ImGui::SameLine();
-            ImGui::ColorButton("##b", ImVec4(t.b.r / 255.0f, t.b.g / 255.0f, t.b.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
-            ImGui::SameLine();
-            const RGB& c3 = t.hasC ? t.c : t.b;
-            ImGui::ColorButton("##c", ImVec4(c3.r / 255.0f, c3.g / 255.0f, c3.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(sz, sz));
-            ImGui::SameLine();
-            if (ImGui::Selectable(kv.first.c_str(), kv.first == g_tpl.name)) g_tpl = kv.second;
-            ImGui::PopID();
+    SectionTitle("TEMPLATE");
+    {
+        float cw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, ch = ImGui::GetFrameHeight() * 2.1f;
+        std::vector<const Template*> list;
+        auto cu = g_templates.find("custom");
+        if (cu != g_templates.end()) list.push_back(&cu->second);
+        for (auto& kv : g_templates) if (kv.first != "custom") list.push_back(&kv.second);
+        int idx = 0;
+        for (const Template* t : list) {
+            if (idx % 2 == 1) ImGui::SameLine();
+            std::string title = (t->name == "custom") ? std::string("Custom (milikmu)") : t->name;
+            if (TemplateCard(title, *t, t->name == g_tpl.name, cw, ch)) g_tpl = *t;
+            idx++;
         }
-        TouchScroll();
-        ImGui::EndChild();
     }
-
-    if (ImGui::CollapsingHeader("Mix manual (custom)")) {
+    SectionTitle("MIX MANUAL / KODE WARNA");
+    ImGui::TextWrapped("Ketuk kolom kode untuk mengetik (keypad hex), atau pakai Tempel untuk memasukkan dari clipboard. Format: #RRGGBB, RGB, atau 120,40,200.");
+    ImGui::Spacing();
+    ColorRow(0, "Warna A (menghadap kamera)");
+    ColorRow(1, "Warna B (tengah)");
+    ColorRow(2, "Warna C (tepi)");
+    {
+        float bw = (ImGui::GetContentRegionAvail().x - sp * 2) / 3.0f, bh = ImGui::GetFrameHeight() * 1.3f;
         Template& cu = g_templates["custom"];
-        cu.name = "custom";
-        float ca[3] = { cu.a.r / 255.0f, cu.a.g / 255.0f, cu.a.b / 255.0f };
-        float cb[3] = { cu.b.r / 255.0f, cu.b.g / 255.0f, cu.b.b / 255.0f };
-        const RGB& c3 = cu.hasC ? cu.c : cu.b;
-        float cc[3] = { c3.r / 255.0f, c3.g / 255.0f, c3.b / 255.0f };
-        bool chg = false;
-        chg |= ImGui::ColorEdit3("A (hadap kamera)", ca);
-        chg |= ImGui::ColorEdit3("B (tengah)", cb);
-        chg |= ImGui::ColorEdit3("C (tepi)", cc);
-        if (chg) {
-            cu.a = ToRGB(ca); cu.b = ToRGB(cb); cu.c = ToRGB(cc); cu.hasC = true;
-            if (g_tpl.name == "custom") g_tpl = cu;
-            g_uniVersion++;
+        if (Btn("Salin palet", ImVec2(bw, bh))) {
+            RGB c3 = cu.hasC ? cu.c : cu.b;
+            Toast(ClipboardSet("#" + HexStr(cu.a) + " #" + HexStr(cu.b) + " #" + HexStr(c3)) ? "Palet disalin" : "Clipboard tidak tersedia");
         }
-        if (ImGui::Button("Pakai custom")) g_tpl = cu;
         ImGui::SameLine();
-        if (ImGui::Button("Salin template aktif")) {
-            if (g_tpl.name != "custom") {
-                cu.a = g_tpl.a; cu.b = g_tpl.b; cu.c = g_tpl.hasC ? g_tpl.c : g_tpl.b; cu.hasC = true;
-                g_uniVersion++;
+        if (Btn("Tempel palet", ImVec2(bw, bh))) {
+            RGB pal[3];
+            int n = ParsePalette(ClipboardGet(), pal);
+            if (n >= 2) { for (int i = 0; i < n; i++) ApplyCustom(i, pal[i]); Toast("Palet ditempel"); }
+            else Toast("Format palet: #RRGGBB #RRGGBB #RRGGBB");
+        }
+        ImGui::SameLine();
+        if (Btn("Salin dari aktif", ImVec2(bw, bh))) {
+            if (g_tpl.name != "custom") { Template src = g_tpl; ApplyCustom(0, src.a); ApplyCustom(1, src.b); ApplyCustom(2, src.hasC ? src.c : src.b); g_tpl = g_templates["custom"]; Toast("Template disalin ke custom"); }
+        }
+    }
+    SectionTitle("SLOT PRESET");
+    {
+        static const char* pm[] = {"Muat", "Simpan"};
+        Segmented("pm", pm, 2, &g_presetMode);
+        ImGui::Spacing();
+        float cw = (ImGui::GetContentRegionAvail().x - sp * 2) / 3.0f, ch = ImGui::GetFrameHeight() * 1.9f;
+        for (int i = 0; i < 6; i++) {
+            if (i % 3) ImGui::SameLine();
+            PresetSlot& ps = g_presets[i];
+            char nm[32]; snprintf(nm, sizeof nm, "Slot %d", i + 1);
+            bool tap;
+            if (ps.used) {
+                Template tmp; tmp.name = nm; tmp.a = ps.a; tmp.b = ps.b; tmp.c = ps.c; tmp.hasC = true;
+                tap = TemplateCard(nm, tmp, false, cw, ch);
+            } else {
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                tap = ImGui::InvisibleButton(nm, ImVec2(cw, ch)) && !Dragged();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(p, ImVec2(p.x + cw, p.y + ch), IM_COL32(40, 40, 54, 255), 12.0f * g_sc);
+                dl->AddRect(p, ImVec2(p.x + cw, p.y + ch), IM_COL32(110, 110, 140, 255), 12.0f * g_sc, 0, 2.0f);
+                std::string t = std::string(nm) + " (kosong)";
+                dl->AddText(ImVec2(p.x + 10.0f * g_sc, p.y + ch * 0.5f - ImGui::GetTextLineHeight() * 0.5f), IM_COL32(170, 170, 200, 255), t.c_str());
+            }
+            if (tap) {
+                Template& cu = g_templates["custom"];
+                if (g_presetMode == 1) {
+                    ps.used = true; ps.a = cu.a; ps.b = cu.b; ps.c = cu.hasC ? cu.c : cu.b;
+                    Toast(std::string("Custom disimpan ke ") + nm);
+                } else if (ps.used) {
+                    ApplyCustom(0, ps.a); ApplyCustom(1, ps.b); ApplyCustom(2, ps.c);
+                    Toast(std::string(nm) + " dimuat ke custom");
+                }
             }
         }
     }
+}
 
-    if (ImGui::CollapsingHeader("Efek per piksel")) {
-        bool ch = false;
-        ch |= ImGui::SliderFloat("Gain sudut", &g_chamGain, 0.2f, 4.0f, "%.2f");
-        ch |= ImGui::SliderFloat("Aliran pantulan", &g_chamFlow, -1.0f, 1.0f, "%.2f");
-        ch |= ImGui::SliderFloat("Geser awal", &g_chamBias, -0.6f, 0.6f, "%.2f");
-        ch |= ImGui::SliderFloat("Kedalaman", &g_chamDepth, 0.0f, 0.8f, "%.2f");
-        ch |= ImGui::SliderFloat("Kilap minimum", &g_chamReflect, 0.0f, 0.6f, "%.2f");
-        ch |= ImGui::SliderFloat("Fresnel", &g_chamFresnel, 0.0f, 1.0f, "%.2f");
-        ch |= ImGui::SliderFloat("Glitter", &g_chamFlake, 0.0f, 0.5f, "%.2f");
-        ch |= ImGui::SliderFloat("Kecerahan", &g_chamBright, 0.3f, 1.5f, "%.2f");
-        if (ch) g_uniVersion++;
+static void TabEfek() {
+    SectionTitle("MODE");
+    static const char* kModes[] = {"Pixel", "Sudut", "Waktu", "Gabungan"};
+    static const int kModeVal[] = {3, 0, 1, 2};
+    int mi = 0;
+    for (int i = 0; i < 4; i++) if (kModeVal[i] == g_shiftMode) mi = i;
+    if (Segmented("mode", kModes, 4, &mi)) g_shiftMode = kModeVal[mi];
+    if (g_shiftMode == 3 && !g_shaderOK) ImGui::TextWrapped("Pixel belum aktif (shader_patch=0 atau hook gagal), dipakai mode sudut.");
+
+    SectionTitle("EFEK PER PIKSEL (live)");
+    bool ch = false;
+    ch |= SliderRow("Gain sudut", &g_chamGain, 0.2f, 4.0f);
+    ch |= SliderRow("Aliran pantulan", &g_chamFlow, -1.0f, 1.0f);
+    ch |= SliderRow("Geser awal", &g_chamBias, -0.6f, 0.6f);
+    ch |= SliderRow("Kedalaman", &g_chamDepth, 0.0f, 0.8f);
+    ch |= SliderRow("Kilap minimum", &g_chamReflect, 0.0f, 0.6f);
+    ch |= SliderRow("Fresnel", &g_chamFresnel, 0.0f, 1.0f);
+    ch |= SliderRow("Glitter", &g_chamFlake, 0.0f, 0.5f);
+    ch |= SliderRow("Kecerahan", &g_chamBright, 0.3f, 1.5f);
+    if (ch) g_uniVersion++;
+
+    SectionTitle("MODE SUDUT / WAKTU");
+    SliderRow("Gain sudut keliling", &g_angleGain, 0.5f, 6.0f);
+    SliderRow("Gain elevasi", &g_elevGain, 0.0f, 4.0f);
+    SliderRow("Beda antar bagian", &g_partSpread, 0.0f, 6.0f);
+    SliderRow("Kecepatan (waktu)", &g_speed, 0.0f, 3.0f);
+    SliderRow("Intensitas", &g_intensity, 0.0f, 1.0f);
+}
+
+static void TabMobil() {
+    SectionTitle("TARGET");
+    static const char* kTg[] = {"Semua mobil", "Hanya terdaftar"};
+    int tg = g_whitelist ? 1 : 0;
+    if (Segmented("tg", kTg, 2, &tg)) g_whitelist = (tg == 1);
+    SectionTitle("MOBIL YANG DIKENDARAI");
+    int cur = CurrentVehicleModel();
+    if (cur >= 0) {
+        ImGui::Text("Model ID: %d", cur);
+        float sp = ImGui::GetStyle().ItemSpacing.x;
+        float bw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, bh = ImGui::GetFrameHeight() * 1.3f;
+        if (Btn("Daftarkan (template aktif)", ImVec2(bw, bh))) { g_carsCfg[std::to_string(cur)] = g_tpl.name; g_needResolve = true; Toast("Mobil didaftarkan"); }
+        ImGui::SameLine();
+        if (Btn("Hapus dari daftar", ImVec2(bw, bh))) { g_carsCfg.erase(std::to_string(cur)); g_needResolve = true; Toast("Mobil dihapus"); }
+    } else {
+        ImGui::TextWrapped("Naiki sebuah mobil untuk mendaftarkannya.");
     }
-
-    if (ImGui::CollapsingHeader("Mode sudut / waktu")) {
-        ImGui::SliderFloat("Gain sudut keliling", &g_angleGain, 0.5f, 6.0f, "%.2f");
-        ImGui::SliderFloat("Gain elevasi", &g_elevGain, 0.0f, 4.0f, "%.2f");
-        ImGui::SliderFloat("Beda antar bagian", &g_partSpread, 0.0f, 6.0f, "%.2f");
-        ImGui::SliderFloat("Kecepatan (waktu)", &g_speed, 0.0f, 3.0f, "%.2f");
-        ImGui::SliderFloat("Intensitas", &g_intensity, 0.0f, 1.0f, "%.2f");
+    SectionTitle("DAFTAR MOBIL");
+    if (g_carsCfg.empty()) ImGui::TextWrapped("Belum ada mobil terdaftar.");
+    std::string del;
+    for (auto& kv : g_carsCfg) {
+        ImGui::PushID(kv.first.c_str());
+        if (Btn("X", ImVec2(ImGui::GetFrameHeight() * 1.3f, ImGui::GetFrameHeight() * 1.2f))) del = kv.first;
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%s  ->  %s", kv.first.c_str(), kv.second.c_str());
+        ImGui::PopID();
     }
+    if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; }
+}
 
-    if (ImGui::CollapsingHeader("Pilih mobil")) {
-        int cur = CurrentVehicleModel();
-        if (cur >= 0) {
-            ImGui::Text("Mobil dikendarai: model %d", cur);
-            if (ImGui::Button("Daftarkan dgn template aktif")) { g_carsCfg[std::to_string(cur)] = g_tpl.name; g_needResolve = true; }
-            ImGui::SameLine();
-            if (ImGui::Button("Hapus mobil ini")) { g_carsCfg.erase(std::to_string(cur)); g_needResolve = true; }
-        } else {
-            ImGui::TextWrapped("Naiki sebuah mobil untuk mendaftarkannya.");
+static void TabSistem() {
+    SectionTitle("PENYIMPANAN");
+    ToggleRow("Simpan otomatis", &g_autoSave);
+    ImGui::TextWrapped("Semua pengaturan (template, warna custom, slider, daftar mobil, preset) tersimpan otomatis ke pearlescent.ini sehingga tidak perlu diatur ulang.");
+    ImGui::Spacing();
+    float sp = ImGui::GetStyle().ItemSpacing.x;
+    float bw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, bh = ImGui::GetFrameHeight() * 1.3f;
+    if (Btn("Simpan sekarang", ImVec2(bw, bh))) { SaveConfig(); g_hashInit = false; Toast("Pengaturan disimpan"); }
+    ImGui::SameLine();
+    if (Btn("Muat ulang dari ini", ImVec2(bw, bh))) { LoadConfig(); g_uniVersion++; Toast("Pengaturan dimuat ulang"); }
+    SectionTitle("TOMBOL MENU");
+    SliderRow("Posisi X", &g_btnX, 0.0f, 0.95f);
+    SliderRow("Posisi Y", &g_btnY, 0.0f, 0.9f);
+    SectionTitle("STATUS");
+    ImGui::TextWrapped("Shader per-piksel: %s", g_shaderOK ? "aktif" : "tidak aktif");
+    ImGui::TextWrapped("Template: %d | Palet shader: %d", (int)g_templates.size(), (int)g_palette.size());
+    ImGui::TextWrapped("Config: %s", g_iniPath.c_str());
+}
+
+static void DrawToast(float W, float H) {
+    double age = NowSec() - g_toastT;
+    if (age > 2.2 || g_toast.empty()) return;
+    float a = age > 1.6 ? (float)(1.0 - (age - 1.6) / 0.6) : 1.0f;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImVec2 ts = ImGui::CalcTextSize(g_toast.c_str());
+    float padX = 18.0f * g_sc, padY = 10.0f * g_sc;
+    ImVec2 p0(W * 0.5f - ts.x * 0.5f - padX, H * 0.86f), p1(W * 0.5f + ts.x * 0.5f + padX, H * 0.86f + ts.y + padY * 2);
+    dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 36, (int)(235 * a)), 14.0f * g_sc);
+    dl->AddRect(p0, p1, IM_COL32(143, 92, 250, (int)(255 * a)), 14.0f * g_sc, 0, 2.0f);
+    dl->AddText(ImVec2(p0.x + padX, p0.y + padY), IM_COL32(255, 255, 255, (int)(255 * a)), g_toast.c_str());
+}
+
+static void BuildUI(float W, float H) {
+    g_noScroll = false;
+    ImDrawList* fdl = nullptr; (void)fdl;
+    // ---- tombol melayang ----
+    {
+        float d = 44.0f * g_sc;
+        ImGui::SetNextWindowPos(ImVec2(W * g_btnX, H * g_btnY), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::Begin("##pcbtn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        if (ImGui::InvisibleButton("##fab", ImVec2(d, d)) && !Dragged()) g_menuOpen = !g_menuOpen;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 c(p.x + d * 0.5f, p.y + d * 0.5f);
+        dl->AddCircleFilled(c, d * 0.5f, IM_COL32(20, 20, 32, 235));
+        dl->AddCircle(c, d * 0.5f - 2.0f * g_sc, ImGui::GetColorU32(g_menuOpen ? kAccent2 : kAccent), 0, 3.0f * g_sc);
+        ImVec2 ts = ImGui::CalcTextSize("PC");
+        dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), "PC");
+        dl->AddCircleFilled(ImVec2(c.x + d * 0.34f, c.y - d * 0.34f), d * 0.09f, g_enabled ? IM_COL32(60, 220, 120, 255) : IM_COL32(235, 70, 70, 255));
+        SaveRect(0);
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+    g_uiRects[1].valid = false;
+    g_uiRects[2].valid = false;
+    if (g_menuOpen) {
+        float mw = W * 0.64f, mh = H * 0.90f;
+        ImGui::SetNextWindowPos(ImVec2(W * 0.5f, H * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+        ImGui::Begin("##pcmain", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
+        SaveRect(1);
+        // header
+        ImGui::AlignTextToFramePadding();
+        ImGui::SetWindowFontScale(1.25f);
+        ImGui::TextColored(kAccent, "CHAMELEON");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine();
+        ImGui::TextDisabled(" Pearlescent");
+        float tw = ImGui::GetFrameHeight() * 0.95f * 1.8f, xw = ImGui::GetFrameHeight() * 1.5f, sp = ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - (tw + xw + sp * 2));
+        Toggle("##master", &g_enabled);
+        ImGui::SameLine();
+        if (Btn("X", ImVec2(xw, ImGui::GetFrameHeight() * 0.95f))) g_menuOpen = false;
+        {
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float w = ImGui::GetContentRegionAvail().x;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilledMultiColor(p, ImVec2(p.x + w * 0.5f, p.y + 3.0f * g_sc), ImGui::GetColorU32(kAccent), ImGui::GetColorU32(kAccent2), ImGui::GetColorU32(kAccent2), ImGui::GetColorU32(kAccent));
+            dl->AddRectFilledMultiColor(ImVec2(p.x + w * 0.5f, p.y), ImVec2(p.x + w, p.y + 3.0f * g_sc), ImGui::GetColorU32(kAccent2), IM_COL32(255, 90, 170, 255), IM_COL32(255, 90, 170, 255), ImGui::GetColorU32(kAccent2));
+            ImGui::Dummy(ImVec2(w, 3.0f * g_sc));
         }
-        ImGui::Separator();
-        ImGui::Text("Daftar mobil (mode 'Hanya mobil terdaftar'):");
-        std::string del;
-        for (auto& kv : g_carsCfg) {
-            ImGui::PushID(kv.first.c_str());
-            if (ImGui::Button("X")) del = kv.first;
-            ImGui::SameLine();
-            ImGui::Text("%s -> %s", kv.first.c_str(), kv.second.c_str());
-            ImGui::PopID();
+        ImGui::Spacing();
+        static const char* kTabs[] = {"Warna", "Efek", "Mobil", "Sistem"};
+        Segmented("tabs", kTabs, 4, &g_tab);
+        ImGui::Spacing();
+        ImGui::BeginChild("##content", ImVec2(0, 0), 0, 0);
+        switch (g_tab) {
+            case 0: TabWarna(); break;
+            case 1: TabEfek(); break;
+            case 2: TabMobil(); break;
+            default: TabSistem(); break;
         }
-        if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; }
+        ImGui::Dummy(ImVec2(0, ImGui::GetFrameHeight()));
+        TouchScroll();
+        ImGui::EndChild();
+        ImGui::End();
     }
+    DrawToast(W, H);
+}
 
-    if (ImGui::CollapsingHeader("Tombol menu")) {
-        ImGui::SliderFloat("Posisi X", &g_btnX, 0.0f, 0.95f, "%.2f");
-        ImGui::SliderFloat("Posisi Y", &g_btnY, 0.0f, 0.9f, "%.2f");
-    }
-
-    TouchScroll();
-    ImGui::End();
+static void ApplyModernStyle(float sc) {
+    ImGui::StyleColorsDark();
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = 18.0f; st.ChildRounding = 12.0f; st.FrameRounding = 10.0f; st.GrabRounding = 10.0f;
+    st.ScrollbarRounding = 10.0f; st.PopupRounding = 12.0f;
+    st.WindowPadding = ImVec2(16, 14); st.FramePadding = ImVec2(12, 8); st.ItemSpacing = ImVec2(10, 10);
+    st.ItemInnerSpacing = ImVec2(8, 6); st.ScrollbarSize = 7.0f; st.GrabMinSize = 22.0f;
+    st.WindowBorderSize = 1.0f; st.FrameBorderSize = 0.0f; st.ChildBorderSize = 0.0f;
+    st.ScaleAllSizes(sc);
+    ImVec4* c = st.Colors;
+    c[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.98f, 1.0f);
+    c[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.55f, 0.66f, 1.0f);
+    c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.11f, 0.97f);
+    c[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.10f, 0.15f, 0.98f);
+    c[ImGuiCol_Border] = ImVec4(0.56f, 0.36f, 0.98f, 0.45f);
+    c[ImGuiCol_FrameBg] = kPanel;
+    c[ImGuiCol_FrameBgHovered] = kPanelHi;
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
+    c[ImGuiCol_SliderGrab] = kAccent;
+    c[ImGuiCol_SliderGrabActive] = kAccent2;
+    c[ImGuiCol_CheckMark] = kAccent2;
+    c[ImGuiCol_Button] = kPanel;
+    c[ImGuiCol_ButtonHovered] = kPanelHi;
+    c[ImGuiCol_ButtonActive] = kAccent;
+    c[ImGuiCol_Separator] = ImVec4(1.0f, 1.0f, 1.0f, 0.10f);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.56f, 0.36f, 0.98f, 0.55f);
+    c[ImGuiCol_ScrollbarGrabHovered] = kAccent;
+    c[ImGuiCol_ScrollbarGrabActive] = kAccent2;
 }
 
 static bool InitMenu() {
@@ -781,22 +1327,23 @@ static bool InitMenu() {
     if (vp[2] < 200 || vp[3] < 200) return false;
     float sc = g_menuScale > 0.0f ? g_menuScale : (float)vp[3] / 480.0f;
     if (sc < 1.0f) sc = 1.0f;
+    g_sc = sc;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    ImFontConfig fc;
-    fc.SizePixels = 13.0f * sc;
-    io.Fonts->AddFontDefault(&fc);
-    ImGui::StyleColorsDark();
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.ScaleAllSizes(sc);
-    st.ScrollbarSize = 10.0f * sc;
-    st.WindowRounding = 4.0f * sc;
+    // font sistem Android (Roboto) agar tampilan modern; cadangan: font bawaan ImGui
+    static const char* fonts[] = {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/Roboto[wdth,wght].ttf", "/system/fonts/DroidSans.ttf", nullptr};
+    bool fontOk = false;
+    for (int i = 0; fonts[i] && !fontOk; i++) {
+        if (access(fonts[i], R_OK) == 0) fontOk = (io.Fonts->AddFontFromFileTTF(fonts[i], 15.0f * sc) != nullptr);
+    }
+    if (!fontOk) { ImFontConfig fc; fc.SizePixels = 13.0f * sc; io.Fonts->AddFontDefault(&fc); }
+    ApplyModernStyle(sc);
     if (!ImGui_ImplOpenGL3_Init("#version 100")) { g_menuFailed = true; logger->Error("Init ImGui gagal"); return false; }
     g_menuReady = true;
-    logger->Info("Menu ImGui siap (skala %.2f, layar %dx%d)", sc, vp[2], vp[3]);
+    logger->Info("Menu ImGui siap (skala %.2f, layar %dx%d, font %s)", sc, vp[2], vp[3], fontOk ? "sistem" : "bawaan");
     return true;
 }
 
@@ -846,6 +1393,17 @@ static void DrawMenuFrame() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
     BuildUI(W, H);
+
+    // simpan otomatis: tunggu pengaturan stabil 1 detik dan jari sudah dilepas
+    uint64_t hsh = SettingsHash();
+    if (!g_hashInit) { g_hashVal = hsh; g_hashInit = true; g_dirty = false; }
+    else if (hsh != g_hashVal) { g_hashVal = hsh; g_dirty = true; g_dirtyT = now; }
+    if (g_dirty && g_autoSave && !down && now - g_dirtyT > 1.0) {
+        SaveConfig();
+        g_dirty = false;
+        Toast("Tersimpan otomatis");
+    }
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
