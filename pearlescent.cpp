@@ -24,9 +24,62 @@
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+#include <chrono>
+#include <algorithm>
+#include <strings.h>
 #include <sys/mman.h>
 
 MYMOD(net.pearl.gtasa, Pearlescent Colors, 1.0, Pearl)
+
+// ---- tulis file secara asinkron ----
+// Storage emulasi (FUSE) lambat: satu fopen/fclose bisa memakan puluhan ms. Semua penulisan file
+// (log, simpan config, dump shader) dikerjakan thread terpisah agar rendering tidak tersendat.
+struct IoJob { std::string path, data; bool append; bool markIni; };
+static std::mutex g_ioMtx;
+static std::condition_variable g_ioCv;
+static std::deque<IoJob> g_ioQ;
+static bool g_ioStarted = false;
+static std::atomic<bool> g_reloadPending(false);   // file ini berubah dari luar
+static std::atomic<long long> g_mtimeA(0);         // mtime ini terakhir yang diketahui
+static std::string g_iniWatch;
+
+static void IoWorker() {
+    for (;;) {
+        std::deque<IoJob> jobs;
+        {
+            std::unique_lock<std::mutex> lk(g_ioMtx);
+            g_ioCv.wait_for(lk, std::chrono::seconds(2), [] { return !g_ioQ.empty(); });
+            jobs.swap(g_ioQ);
+        }
+        for (const IoJob& j : jobs) {
+            FILE* fp = fopen(j.path.c_str(), j.append ? "a" : "w");
+            if (fp) { fwrite(j.data.data(), 1, j.data.size(), fp); fclose(fp); }
+            if (j.markIni) { struct stat st; if (stat(j.path.c_str(), &st) == 0) g_mtimeA.store((long long)st.st_mtime); }
+        }
+        if (!g_iniWatch.empty()) {   // pantau perubahan ini dari luar (edit manual)
+            struct stat st;
+            if (stat(g_iniWatch.c_str(), &st) == 0) {
+                long long m = (long long)st.st_mtime, known = g_mtimeA.load();
+                if (known == 0) g_mtimeA.store(m);
+                else if (m != known) { g_mtimeA.store(m); g_reloadPending.store(true); }
+            }
+        }
+    }
+}
+static void IoStart() { if (g_ioStarted) return; g_ioStarted = true; std::thread(IoWorker).detach(); }
+static void IoPost(const std::string& path, const std::string& data, bool append, bool markIni) {
+    {
+        std::lock_guard<std::mutex> lk(g_ioMtx);
+        if (g_ioQ.size() > 400) return;
+        g_ioQ.push_back({path, data, append, markIni});
+    }
+    g_ioCv.notify_one();
+}
 
 static std::string g_logPath;
 struct SimpleLogger {
@@ -35,10 +88,7 @@ struct SimpleLogger {
         char buf[512];
         vsnprintf(buf, sizeof buf, f, a);
         __android_log_print(prio, "Pearlescent", "%s", buf);
-        if (!g_logPath.empty()) {
-            FILE* fp = fopen(g_logPath.c_str(), "a");
-            if (fp) { fprintf(fp, "[%s] %s\n", tag, buf); fclose(fp); }
-        }
+        if (!g_logPath.empty()) IoPost(g_logPath, std::string("[") + tag + "] " + buf + "\n", true, false);
     }
     void Info(const char* f, ...) { va_list a; va_start(a, f); Write(ANDROID_LOG_INFO, "INFO", f, a); va_end(a); }
     void Error(const char* f, ...) { va_list a; va_start(a, f); Write(ANDROID_LOG_ERROR, "ERROR", f, a); va_end(a); }
@@ -89,6 +139,49 @@ static Template& CustomT() {
     t.name = g_curCustom;
     if (!t.hasC) { t.c = t.b; t.hasC = true; }
     return t;
+}
+static std::map<std::string, int> g_keyToId;   // kunci nama di [cars] -> id model (diisi ResolveCars)
+// ---- nama kendaraan bawaan game (ID 400-611). Untuk model tambahan ditampilkan sebagai "Kendaraan kustom". ----
+static const char* const kVehNames[212] = {
+    "Landstalker", "Bravura", "Buffalo", "Linerunner", "Perennial", "Sentinel", "Dumper", "Firetruck",
+    "Trashmaster", "Stretch", "Manana", "Infernus", "Voodoo", "Pony", "Mule", "Cheetah", "Ambulance",
+    "Leviathan", "Moonbeam", "Esperanto", "Taxi", "Washington", "Bobcat", "Mr. Whoopee", "BF Injection",
+    "Hunter", "Premier", "Enforcer", "Securicar", "Banshee", "Predator", "Bus", "Rhino", "Barracks",
+    "Hotknife", "Artic Trailer 1", "Previon", "Coach", "Cabbie", "Stallion", "Rumpo", "RC Bandit", "Romero",
+    "Packer", "Monster", "Admiral", "Squalo", "Seasparrow", "Pizzaboy", "Tram", "Artic Trailer 2", "Turismo",
+    "Speeder", "Reefer", "Tropic", "Flatbed", "Yankee", "Caddy", "Solair", "Berkley's RC Van", "Skimmer",
+    "PCJ-600", "Faggio", "Freeway", "RC Baron", "RC Raider", "Glendale", "Oceanic", "Sanchez", "Sparrow",
+    "Patriot", "Quad", "Coastguard", "Dinghy", "Hermes", "Sabre", "Rustler", "ZR-350", "Walton", "Regina",
+    "Comet", "BMX", "Burrito", "Camper", "Marquis", "Baggage", "Dozer", "Maverick", "News Chopper", "Rancher",
+    "FBI Rancher", "Virgo", "Greenwood", "Jetmax", "Hotring Racer", "Sandking", "Blista Compact",
+    "Police Maverick", "Boxville", "Benson", "Mesa", "RC Goblin", "Hotring Racer A", "Hotring Racer B",
+    "Bloodring Banger", "Rancher Lure", "Super GT", "Elegant", "Journey", "Bike", "Mountain Bike", "Beagle",
+    "Cropduster", "Stuntplane", "Tanker", "Roadtrain", "Nebula", "Majestic", "Buccaneer", "Shamal", "Hydra",
+    "FCR-900", "NRG-500", "HPV1000", "Cement Truck", "Tow Truck", "Fortune", "Cadrona", "FBI Truck",
+    "Willard", "Forklift", "Tractor", "Combine Harvester", "Feltzer", "Remington", "Slamvan", "Blade",
+    "Freight", "Brownstreak", "Vortex", "Vincent", "Bullet", "Clover", "Sadler", "Firetruck LA", "Hustler",
+    "Intruder", "Primo", "Cargobob", "Tampa", "Sunrise", "Merit", "Utility Van", "Nevada", "Yosemite",
+    "Windsor", "Monster A", "Monster B", "Uranus", "Jester", "Sultan", "Stratum", "Elegy", "Raindance",
+    "RC Tiger", "Flash", "Tahoma", "Savanna", "Bandito", "Freight Flat Trailer", "Streak Trailer", "Kart",
+    "Mower", "Dune", "Sweeper", "Broadway", "Tornado", "AT-400", "DFT-30", "Huntley", "Stafford", "BF-400",
+    "Newsvan", "Tug", "Petrol Trailer", "Emperor", "Wayfarer", "Euros", "Hotdog", "Club",
+    "Freight Box Trailer", "Artic Trailer 3", "Andromada", "Dodo", "RC Cam", "Launch", "Police LS",
+    "Police SF", "Police LV", "Police Ranger", "Picador", "S.W.A.T.", "Alpha", "Phoenix", "Glendale Damaged",
+    "Sadler Damaged", "Baggage Trailer A", "Baggage Trailer B", "Tug Stairs Trailer", "Boxville Mission",
+    "Farm Trailer", "Utility Trailer",
+};
+static const char* VehicleName(int id) { return (id >= 400 && id <= 611) ? kVehNames[id - 400] : nullptr; }
+static std::string VehicleLabel(int id) {
+    const char* n = VehicleName(id);
+    return n ? std::string(n) + " (ID " + std::to_string(id) + ")" : "Kendaraan kustom (ID " + std::to_string(id) + ")";
+}
+static std::string KeyLabel(const std::string& key) {   // kunci di [cars]: ID angka atau nama model
+    bool numeric = !key.empty() && isdigit((unsigned char)key[0]);
+    int id = -1;
+    if (numeric) id = atoi(key.c_str());
+    else { auto it = g_keyToId.find(key); if (it != g_keyToId.end()) id = it->second; }
+    if (id < 0) return key;
+    return numeric ? VehicleLabel(id) : key + " -> " + VehicleLabel(id);
 }
 static std::string DisplayName(const std::string& n) {
     int sl = 0;
@@ -155,6 +248,7 @@ struct UiRect { float x0, y0, x1, y1; bool valid; };
 static UiRect g_uiRects[3] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
 static bool  g_autoSave = true;
 static bool  g_tutorialDone = false;       // panduan awal sudah ditutup
+static bool  g_debugLog = false;           // ini: debug_log (log rinci per kendaraan/shader)
 static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
 static PresetSlot g_presets[6];
@@ -238,7 +332,7 @@ static void LoadConfig() {
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
-    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone;
+    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone, debugV = g_debugLog;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
@@ -286,6 +380,7 @@ static void LoadConfig() {
             else if (k == "enabled") enabledV = (atoi(v.c_str()) != 0);
             else if (k == "autosave") autoSaveV = (atoi(v.c_str()) != 0);
             else if (k == "tutorial_done") tutorialV = (atoi(v.c_str()) != 0);
+            else if (k == "debug_log") debugV = (atoi(v.c_str()) != 0);
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
@@ -318,21 +413,17 @@ static void LoadConfig() {
     g_menuEnabled = menuOn; g_menuScale = menuScale; g_btnX = btnX; g_btnY = btnY;
     g_btnAlpha = btnAlpha < 0.1f ? 0.1f : (btnAlpha > 1.0f ? 1.0f : btnAlpha);
     g_panelAlpha = panelAlpha < 0.4f ? 0.4f : (panelAlpha > 1.0f ? 1.0f : panelAlpha);
-    g_enabled = enabledV; g_autoSave = autoSaveV; g_tutorialDone = tutorialV;
+    g_enabled = enabledV; g_autoSave = autoSaveV; g_tutorialDone = tutorialV; g_debugLog = debugV;
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
     g_uniVersion++;
     g_whitelist = whitelist; g_carsCfg = cars; g_carById.clear(); g_needResolve = true;
-    struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
+    { struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtimeA.store((long long)st.st_mtime); }
     logger->Info("Config dimuat. Template aktif: %s", g_tpl.name.c_str());
 }
 
 static void MaybeReload() {
-    double now = NowSec();
-    if (now - g_lastCheck < 1.0) return;
-    g_lastCheck = now;
-    struct stat st;
-    if (stat(g_iniPath.c_str(), &st) == 0 && st.st_mtime != g_mtime) LoadConfig();
+    if (g_reloadPending.exchange(false)) LoadConfig();   // dipicu thread I/O bila file diubah dari luar
 }
 
 static bool ViewAngles(void* clump, void* partFrame, float& az, float& el) {
@@ -391,7 +482,7 @@ static RGB Pearl(void* clump, void* partFrame, const Template& tp) {
     }
     float t = 0.5f + 0.5f * sinf(arg);
     static int logged = 0;
-    if (logged < 8) { logged++; logger->Info("pearl: angle_ok=%d az0=%.2f el0=%.2f arg=%.2f t=%.2f bagian=%p", (int)ok, az0, el0, arg, t, partFrame); }
+    if (g_debugLog && logged < 8) { logged++; logger->Info("pearl: angle_ok=%d az0=%.2f el0=%.2f arg=%.2f t=%.2f bagian=%p", (int)ok, az0, el0, arg, t, partFrame); }
     return Ramp(tp, t * tp.intensity * g_intensity);
 }
 
@@ -423,12 +514,13 @@ static int ModelIdOf(void* clump) {
 
 static void ResolveCars() {
     g_carById.clear();
+    g_keyToId.clear();
     for (auto& kv : g_carsCfg) {
         const std::string& k = kv.first;
         int id = -1;
         if (!k.empty() && isdigit((unsigned char)k[0])) id = atoi(k.c_str());
         else if (GetModelInfoByName) { int out = -1; if (GetModelInfoByName(k.c_str(), &out) && out >= 0) id = out; }
-        if (id >= 0) g_carById[id] = kv.second;
+        if (id >= 0) { g_carById[id] = kv.second; g_keyToId[k] = id; }
         else logger->Error("Mobil tidak ditemukan: %s", k.c_str());
     }
     g_needResolve = false;
@@ -437,23 +529,28 @@ static void ResolveCars() {
 static void SetEditableMaterials_hook(void* clump) {
     g_primary.clear();
     g_matSeen = 0;
-    if (g_ready && clump) { MaybeReload(); RpClumpForAllAtomics(clump, OnAtomic, nullptr); }
-    SetEditableMaterials_orig(clump);
-    if (g_ready && clump && g_loggedIds.size() < 40) {
-        int mid = ModelIdOf(clump);
-        if (g_loggedIds.insert(mid).second)
-            logger->Info("kendaraan model id=%d, material dilihat=%d, primary ditemukan=%d, whitelist=%d, geom_offset=%d", mid, g_matSeen, (int)g_primary.size(), (int)g_whitelist, g_geomOff);
-    }
-    if (g_enabled && !g_primary.empty()) {
+    bool active = g_ready && g_enabled && clump;
+    const Template* tp = &g_tpl;
+    if (active) {
+        MaybeReload();
         if (g_needResolve) ResolveCars();
-        const Template* tp = &g_tpl;
         auto car = g_carById.find(ModelIdOf(clump));
         if (car != g_carById.end()) {
             auto tt = g_templates.find(car->second);
             if (tt != g_templates.end()) tp = &tt->second;
         } else if (g_whitelist) {
-            return;  // mobil lain tidak diubah
+            active = false;   // mobil lain: tidak disentuh sama sekali (hemat CPU, tanpa jalan-jalan di material)
         }
+    }
+    if (active) RpClumpForAllAtomics(clump, OnAtomic, nullptr);
+    SetEditableMaterials_orig(clump);
+    if (g_debugLog && g_ready && clump && g_loggedIds.size() < 40) {
+        int mid = ModelIdOf(clump);
+        if (g_loggedIds.insert(mid).second)
+            logger->Info("kendaraan model id=%d, material dilihat=%d, primary ditemukan=%d, whitelist=%d, geom_offset=%d", mid, g_matSeen, (int)g_primary.size(), (int)g_whitelist, g_geomOff);
+    }
+    if (!active || g_primary.empty()) return;
+    {
         if (g_shiftMode == 3 && g_shaderOK) {
             // tandai material primary; shader menghitung warna per piksel
             int cslot = 0;
@@ -569,10 +666,9 @@ static void glShaderSource_hook(unsigned shader, int count, const char* const* s
             g_shaderPatched++;
             if (g_shaderPatched <= 4) {
                 std::string dump = g_logPath.substr(0, g_logPath.find_last_of('/') + 1) + "pearlescent_shaders.txt";
-                FILE* fp = fopen(dump.c_str(), g_shaderPatched == 1 ? "w" : "a");
-                if (fp) { fprintf(fp, "===== shader #%d =====\n%s\n", g_shaderPatched, src.c_str()); fclose(fp); }
+                IoPost(dump, "===== shader #" + std::to_string(g_shaderPatched) + " =====\n" + src + "\n", g_shaderPatched != 1, false);
             }
-            logger->Info("Shader dipatch (#%d)", g_shaderPatched);
+            if (g_debugLog) logger->Info("Shader dipatch (#%d)", g_shaderPatched);
             const char* ptr = src.c_str();
             glShaderSource_orig(shader, 1, &ptr, nullptr);
             return;
@@ -628,12 +724,14 @@ static void glUseProgram_hook(unsigned prog) {
     ProgLocs& L = g_progs[prog];
     if (!L.known) {
         L.p0 = glGetUniformLocation(prog, "ChamP0");
-        L.p1 = glGetUniformLocation(prog, "ChamP1");
-        for (int i = 0; i < 8; i++) {
-            char nm[16];
-            snprintf(nm, sizeof nm, "ChamA%d", i); L.ca[i] = glGetUniformLocation(prog, nm);
-            snprintf(nm, sizeof nm, "ChamB%d", i); L.cb[i] = glGetUniformLocation(prog, nm);
-            snprintf(nm, sizeof nm, "ChamC%d", i); L.cc[i] = glGetUniformLocation(prog, nm);
+        if (L.p0 >= 0) {   // hanya program chameleon yang punya uniform ini
+            L.p1 = glGetUniformLocation(prog, "ChamP1");
+            for (int i = 0; i < 8; i++) {
+                char nm[16];
+                snprintf(nm, sizeof nm, "ChamA%d", i); L.ca[i] = glGetUniformLocation(prog, nm);
+                snprintf(nm, sizeof nm, "ChamB%d", i); L.cb[i] = glGetUniformLocation(prog, nm);
+                snprintf(nm, sizeof nm, "ChamC%d", i); L.cc[i] = glGetUniformLocation(prog, nm);
+            }
         }
         L.known = true;
     }
@@ -650,36 +748,41 @@ static void glLinkProgram_hook(unsigned prog) {
 // ================= simpan config =================
 static const char* ShiftName(int m) { return m == 1 ? "time" : (m == 2 ? "both" : (m == 3 ? "pixel" : "angle")); }
 
-static void WriteTpl(FILE* f, const Template& t) {
-    if (IsCustomName(t.name)) fprintf(f, "\n[%s]\n", t.name.c_str()); else fprintf(f, "\n[template:%s]\n", t.name.c_str());
-    fprintf(f, "a=%d,%d,%d\nb=%d,%d,%d\n", t.a.r, t.a.g, t.a.b, t.b.r, t.b.g, t.b.b);
-    if (t.hasC) fprintf(f, "c=%d,%d,%d\n", t.c.r, t.c.g, t.c.b);
-    if (t.intensity != 1.0f) fprintf(f, "intensity=%.2f\n", t.intensity);
+static void Pf(std::string& out, const char* fmt, ...) {
+    char b[768];
+    va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+    out += b;
+}
+
+static void WriteTpl(std::string& out, const Template& t) {
+    if (IsCustomName(t.name)) Pf(out, "\n[%s]\n", t.name.c_str()); else Pf(out, "\n[template:%s]\n", t.name.c_str());
+    Pf(out, "a=%d,%d,%d\nb=%d,%d,%d\n", t.a.r, t.a.g, t.a.b, t.b.r, t.b.g, t.b.b);
+    if (t.hasC) Pf(out, "c=%d,%d,%d\n", t.c.r, t.c.g, t.c.b);
+    if (t.intensity != 1.0f) Pf(out, "intensity=%.2f\n", t.intensity);
 }
 
 static void SaveConfig() {
-    FILE* f = fopen(g_iniPath.c_str(), "w");
-    if (!f) { logger->Error("Gagal menyimpan %s", g_iniPath.c_str()); return; }
-    fprintf(f, "; Pearlescent Colors - disimpan dari menu in-game\n[settings]\n");
-    fprintf(f, "enabled=%d\nautosave=%d\ntutorial_done=%d\n", g_enabled ? 1 : 0, g_autoSave ? 1 : 0, g_tutorialDone ? 1 : 0);
-    fprintf(f, "mode=%s\nactive=%s\nshift_mode=%s\n", g_whitelist ? "whitelist" : "all", g_tpl.name.c_str(), ShiftName(g_shiftMode));
-    fprintf(f, "angle_gain=%.2f\nelev_gain=%.2f\npart_spread=%.2f\nspeed=%.2f\nintensity=%.2f\n", g_angleGain, g_elevGain, g_partSpread, g_speed, g_intensity);
-    fprintf(f, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
-    fprintf(f, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
+    std::string out;
+    Pf(out, "; Pearlescent Colors - disimpan dari menu in-game\n[settings]\n");
+    Pf(out, "enabled=%d\nautosave=%d\ntutorial_done=%d\n", g_enabled ? 1 : 0, g_autoSave ? 1 : 0, g_tutorialDone ? 1 : 0);
+    Pf(out, "mode=%s\nactive=%s\nshift_mode=%s\n", g_whitelist ? "whitelist" : "all", g_tpl.name.c_str(), ShiftName(g_shiftMode));
+    Pf(out, "angle_gain=%.2f\nelev_gain=%.2f\npart_spread=%.2f\nspeed=%.2f\nintensity=%.2f\n", g_angleGain, g_elevGain, g_partSpread, g_speed, g_intensity);
+    Pf(out, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
+    Pf(out, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
             g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
-    fprintf(f, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
-    fprintf(f, "\n[cars]\n");
-    for (auto& kv : g_carsCfg) fprintf(f, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
-    for (int i = 0; i < 8; i++) { auto cu = g_templates.find(CustomName(i)); if (cu != g_templates.end()) WriteTpl(f, cu->second); }
-    for (auto& kv : g_templates) if (!IsCustomName(kv.first)) WriteTpl(f, kv.second);
+    Pf(out, "debug_log=%d\n", g_debugLog ? 1 : 0);
+    Pf(out, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
+    Pf(out, "\n[cars]\n");
+    for (auto& kv : g_carsCfg) Pf(out, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
+    for (int i = 0; i < 8; i++) { auto cu = g_templates.find(CustomName(i)); if (cu != g_templates.end()) WriteTpl(out, cu->second); }
+    for (auto& kv : g_templates) if (!IsCustomName(kv.first)) WriteTpl(out, kv.second);
     for (int i = 0; i < 6; i++) {
         if (!g_presets[i].used) continue;
         const PresetSlot& ps = g_presets[i];
-        fprintf(f, "\n[preset:%d]\na=%d,%d,%d\nb=%d,%d,%d\nc=%d,%d,%d\n", i + 1, ps.a.r, ps.a.g, ps.a.b, ps.b.r, ps.b.g, ps.b.b, ps.c.r, ps.c.g, ps.c.b);
+        Pf(out, "\n[preset:%d]\na=%d,%d,%d\nb=%d,%d,%d\nc=%d,%d,%d\n", i + 1, ps.a.r, ps.a.g, ps.a.b, ps.b.r, ps.b.g, ps.b.b, ps.c.r, ps.c.g, ps.c.b);
     }
-    fclose(f);
-    struct stat st; if (stat(g_iniPath.c_str(), &st) == 0) g_mtime = st.st_mtime;
-    logger->Info("Config disimpan");
+    IoPost(g_iniPath, out, false, true);   // ditulis thread I/O; mtime diperbarui setelah selesai
+    if (g_debugLog) logger->Info("Config disimpan");
 }
 
 // ================= clipboard (JNI) =================
@@ -905,6 +1008,7 @@ static bool SlotInUse(const std::string& n) {
     return false;
 }
 static void ChooseColor(const Template& t);
+static void ShowVehicleInfo();
 static int   g_tab = 0, g_editSlot = -1, g_pickSlot = -1, g_presetMode = 0;
 static bool  g_hexFresh = false;
 static std::string g_hexBuf, g_toast;
@@ -1210,6 +1314,13 @@ static int LumClass(const Template& t) {   // 1 = gelap, 2 = sedang, 3 = terang
 }
 static const Template* TemplateByName(const std::string& n) { auto it = g_templates.find(n); return it == g_templates.end() ? nullptr : &it->second; }
 
+static void ShowVehicleInfo() {
+    if (g_curCar < 0) return;
+    const char* nm = VehicleName(g_curCar);
+    ImGui::Text("Nama: %s", nm ? nm : "Kendaraan kustom");
+    ImGui::Text("ID: %d", g_curCar);
+}
+
 static void ChooseColor(const Template& t) {
     std::string name = t.name;
     if (IsCustomName(name)) g_curCustom = name;
@@ -1217,7 +1328,7 @@ static void ChooseColor(const Template& t) {
         if (g_curCar < 0) { Toast("Naiki mobil dulu untuk memberi warna khusus"); return; }
         g_carsCfg[std::to_string(g_curCar)] = name;
         g_needResolve = true;
-        Toast("Mobil " + std::to_string(g_curCar) + " memakai " + DisplayName(name));
+        Toast(VehicleLabel(g_curCar) + " memakai " + DisplayName(name));
     } else {
         auto it = g_templates.find(name);
         g_tpl = (it != g_templates.end()) ? it->second : t;
@@ -1327,7 +1438,7 @@ static void TabUtama() {
     CardBegin();
     ImGui::TextColored(kAccent2, "Mobil yang sedang dikendarai");
     if (g_curCar >= 0) {
-        ImGui::Text("Model: %d", g_curCar);
+        ShowVehicleInfo();
         auto ex = g_carsCfg.find(std::to_string(g_curCar));
         if (ex != g_carsCfg.end()) {
             const Template* t = TemplateByName(ex->second);
@@ -1372,7 +1483,7 @@ static void TabWarna() {
     static const char* kScope[] = {"Semua mobil", "Mobil ini saja"};
     int sc = g_scopeCar ? 1 : 0;
     if (Segmented("scope", kScope, 2, &sc)) g_scopeCar = (sc == 1);
-    if (g_scopeCar) Hint(g_curCar >= 0 ? "Pilihan di bawah hanya berlaku untuk mobil yang sedang kamu kendarai (model " + std::to_string(g_curCar) + ")."
+    if (g_scopeCar) Hint(g_curCar >= 0 ? "Pilihan di bawah hanya berlaku untuk mobil yang sedang kamu kendarai: " + VehicleLabel(g_curCar) + "."
                                        : "Naiki sebuah mobil dulu agar bisa memilih warna khusus untuk mobil itu.");
     else Hint("Pilihan di bawah berlaku untuk semua mobil yang tidak punya warna khusus.");
     ImGui::Spacing();
@@ -1510,6 +1621,48 @@ static void TabEfek() {
     ImGui::PopStyleColor(2);
 }
 
+// ---------------- pilih mobil dari daftar nama ----------------
+static void VehiclePicker() {
+    static bool open = false;
+    static int range = 0;
+    static std::vector<int> order;
+    float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
+    SectionTitle("TAMBAH MOBIL DARI DAFTAR NAMA");
+    Hint("Pilih mobil lewat namanya tanpa harus menaikinya. Mobil memakai warna umum yang aktif (ganti lewat tab Warna). Ketuk lagi untuk menghapus.");
+    if (Btn(open ? "Sembunyikan daftar nama" : "Tampilkan daftar nama", ImVec2(AvailW(), bh))) open = !open;
+    if (!open) return;
+    if (order.empty()) {
+        for (int id = 400; id <= 611; id++) order.push_back(id);
+        std::sort(order.begin(), order.end(), [](int a, int b) { return strcasecmp(kVehNames[a - 400], kVehNames[b - 400]) < 0; });
+    }
+    static const char* kR[] = {"A-D", "E-L", "M-R", "S-Z"};
+    Segmented("vr", kR, 4, &range);
+    ImGui::Spacing();
+    float cw = (AvailW() - sp) / 2.0f;
+    int n = 0;
+    for (int id : order) {
+        const char* nm = kVehNames[id - 400];
+        char c = (char)toupper((unsigned char)nm[0]);
+        bool inRange = range == 0 ? (c >= 'A' && c <= 'D') : (range == 1 ? (c >= 'E' && c <= 'L') : (range == 2 ? (c >= 'M' && c <= 'R') : (c >= 'S' && c <= 'Z')));
+        if (!inRange) continue;
+        if (n % 2 == 1) ImGui::SameLine();
+        std::string key = std::to_string(id);
+        bool reg = g_carsCfg.count(key) > 0;
+        std::string lb = std::string(nm) + " (" + key + ")";
+        ImGui::PushID(id);
+        ImGui::PushStyleColor(ImGuiCol_Button, reg ? kAccent : kPanel);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, reg ? kAccent : kPanelHi);
+        if (Btn(lb.c_str(), ImVec2(cw, bh))) {
+            if (reg) { g_carsCfg.erase(key); Toast(VehicleLabel(id) + " dihapus dari daftar"); }
+            else { g_carsCfg[key] = g_tpl.name; Toast(VehicleLabel(id) + " ditambahkan"); }
+            g_needResolve = true;
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::PopID();
+        n++;
+    }
+}
+
 // ---------------- TAB MOBIL ----------------
 static void TabMobil() {
     float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
@@ -1521,7 +1674,7 @@ static void TabMobil() {
 
     SectionTitle("MOBIL YANG DIKENDARAI");
     if (g_curCar >= 0) {
-        ImGui::Text("Model: %d", g_curCar);
+        ShowVehicleInfo();
         auto ex = g_carsCfg.find(std::to_string(g_curCar));
         float b2 = (AvailW() - sp) / 2.0f;
         if (ex == g_carsCfg.end()) {
@@ -1541,7 +1694,7 @@ static void TabMobil() {
     for (auto& kv : g_carsCfg) {
         ImGui::PushID(kv.first.c_str());
         CardBegin();
-        ImGui::Text("Mobil: %s%s", kv.first.c_str(), (std::to_string(g_curCar) == kv.first) ? "  (sedang dikendarai)" : "");
+        ImGui::TextWrapped("%s%s", KeyLabel(kv.first).c_str(), (g_curCar >= 0 && std::to_string(g_curCar) == kv.first) ? "  (sedang dikendarai)" : "");
         const Template* t = TemplateByName(kv.second);
         if (t) DrawTplBar(*t, ImGui::GetFrameHeight() * 1.4f, DisplayName(kv.second));
         else Hint("Warna tidak ditemukan: " + kv.second);
@@ -1561,6 +1714,7 @@ static void TabMobil() {
         ImGui::PopID();
     }
     if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; Toast("Mobil dihapus dari daftar"); }
+    VehiclePicker();
 }
 
 // ---------------- TAB LAINNYA ----------------
@@ -1776,7 +1930,7 @@ static void DrawMenuFrame() {
 
     // diagnostik: catat state GL pada beberapa frame pertama dan berkala
     static int frames = 0, logs = 0;
-    if ((frames < 4 || frames % 900 == 0) && logs < 14) {
+    if (g_debugLog && (frames < 4 || frames % 900 == 0) && logs < 14) {
         GLint vpd[4] = {0, 0, 0, 0}, fbo = 0; GLboolean cm[4] = {1, 1, 1, 1};
         glGetIntegerv(GL_VIEWPORT, vpd); glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo); glGetBooleanv(GL_COLOR_WRITEMASK, cm);
         logger->Info("frame=%d layar=%dx%d viewport=%d,%d,%d,%d fbo=%d colormask=%d%d%d%d", frames, ww, hh, vpd[2 - 2], vpd[1], vpd[2], vpd[3], fbo, cm[0], cm[1], cm[2], cm[3]);
@@ -1871,6 +2025,8 @@ ON_MOD_PRELOAD() {
     g_iniPath = cfg + "pearlescent.ini";
     g_logPath = cfg + "pearlescent_log.txt";
     { FILE* c = fopen(g_logPath.c_str(), "w"); if (c) fclose(c); }
+    g_iniWatch = g_iniPath;
+    IoStart();
 
     void* hook_target = (void*)aml->GetSym(h, "_ZN17CVehicleModelInfo20SetEditableMaterialsEP7RpClump");
     RpClumpForAllAtomics = (decltype(RpClumpForAllAtomics))aml->GetSym(h, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
