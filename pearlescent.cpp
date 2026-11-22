@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cctype>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <set>
 #include <cstdio>
@@ -153,6 +154,7 @@ static bool  g_enabled = true;            // master on/off
 struct UiRect { float x0, y0, x1, y1; bool valid; };
 static UiRect g_uiRects[3] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false}, {0, 0, 0, 0, false} };
 static bool  g_autoSave = true;
+static bool  g_tutorialDone = false;       // panduan awal sudah ditutup
 static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
 static PresetSlot g_presets[6];
@@ -236,7 +238,7 @@ static void LoadConfig() {
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
-    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave;
+    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
@@ -283,6 +285,7 @@ static void LoadConfig() {
             else if (k == "menu") menuOn = (atoi(v.c_str()) != 0);
             else if (k == "enabled") enabledV = (atoi(v.c_str()) != 0);
             else if (k == "autosave") autoSaveV = (atoi(v.c_str()) != 0);
+            else if (k == "tutorial_done") tutorialV = (atoi(v.c_str()) != 0);
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
@@ -315,7 +318,7 @@ static void LoadConfig() {
     g_menuEnabled = menuOn; g_menuScale = menuScale; g_btnX = btnX; g_btnY = btnY;
     g_btnAlpha = btnAlpha < 0.1f ? 0.1f : (btnAlpha > 1.0f ? 1.0f : btnAlpha);
     g_panelAlpha = panelAlpha < 0.4f ? 0.4f : (panelAlpha > 1.0f ? 1.0f : panelAlpha);
-    g_enabled = enabledV; g_autoSave = autoSaveV;
+    g_enabled = enabledV; g_autoSave = autoSaveV; g_tutorialDone = tutorialV;
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
     g_uniVersion++;
@@ -658,7 +661,7 @@ static void SaveConfig() {
     FILE* f = fopen(g_iniPath.c_str(), "w");
     if (!f) { logger->Error("Gagal menyimpan %s", g_iniPath.c_str()); return; }
     fprintf(f, "; Pearlescent Colors - disimpan dari menu in-game\n[settings]\n");
-    fprintf(f, "enabled=%d\nautosave=%d\n", g_enabled ? 1 : 0, g_autoSave ? 1 : 0);
+    fprintf(f, "enabled=%d\nautosave=%d\ntutorial_done=%d\n", g_enabled ? 1 : 0, g_autoSave ? 1 : 0, g_tutorialDone ? 1 : 0);
     fprintf(f, "mode=%s\nactive=%s\nshift_mode=%s\n", g_whitelist ? "whitelist" : "all", g_tpl.name.c_str(), ShiftName(g_shiftMode));
     fprintf(f, "angle_gain=%.2f\nelev_gain=%.2f\npart_spread=%.2f\nspeed=%.2f\nintensity=%.2f\n", g_angleGain, g_elevGain, g_partSpread, g_speed, g_intensity);
     fprintf(f, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
@@ -846,7 +849,7 @@ static void HashRGB(Fnv& f, const RGB& c) { f.v(c.r); f.v(c.g); f.v(c.b); }
 
 static uint64_t SettingsHash() {
     Fnv f;
-    f.v(g_enabled); f.v(g_autoSave); f.v(g_whitelist); f.v(g_shiftMode); f.s(g_tpl.name);
+    f.v(g_enabled); f.v(g_autoSave); f.v(g_tutorialDone); f.v(g_whitelist); f.v(g_shiftMode); f.s(g_tpl.name);
     f.v(g_angleGain); f.v(g_elevGain); f.v(g_partSpread); f.v(g_speed); f.v(g_intensity);
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
     f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
@@ -890,6 +893,18 @@ static int GetButton_hook(int idx, int btn) {
 static float g_sc = 1.0f;
 static bool  g_noScroll = false;
 static float Gutter() { return 46.0f * g_sc; }   // area kosong di kanan untuk menggeser (scroll)
+static float g_rightPad = 0.0f;                  // padding kanan saat berada di dalam kartu
+static float AvailW() { return ImGui::GetContentRegionAvail().x - g_rightPad; }
+static int   g_curCar = -1;                      // model mobil yang sedang dikendarai (-1 = tidak ada)
+static bool  g_scopeCar = false;                 // true: pilihan warna hanya untuk mobil yang dikendarai
+static bool  g_advanced = false;
+static int   g_filter = 0;
+static bool SlotInUse(const std::string& n) {
+    if (g_tpl.name == n) return true;
+    for (auto& kv : g_carsCfg) if (kv.second == n) return true;
+    return false;
+}
+static void ChooseColor(const Template& t);
 static int   g_tab = 0, g_editSlot = -1, g_pickSlot = -1, g_presetMode = 0;
 static bool  g_hexFresh = false;
 static std::string g_hexBuf, g_toast;
@@ -925,6 +940,7 @@ static void ResetAll() {
     auto it = g_templates.find("Purple-Blue-Green");
     g_tpl = (it != g_templates.end()) ? it->second : g_templates["custom"];
     g_editSlot = -1; g_pickSlot = -1;
+    g_scopeCar = false; g_advanced = false; g_tutorialDone = false;
     g_uniVersion++;
 }
 
@@ -988,7 +1004,7 @@ static bool ToggleRow(const char* label, bool* v) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
     float tw = ImGui::GetFrameHeight() * 0.95f * 1.8f;
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - tw);
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - tw - g_rightPad);
     ImGui::PushID(label);
     bool r = Toggle("##t", v);
     ImGui::PopID();
@@ -997,7 +1013,7 @@ static bool ToggleRow(const char* label, bool* v) {
 
 static bool Segmented(const char* id, const char* const* items, int n, int* sel) {
     bool changed = false;
-    float avail = ImGui::GetContentRegionAvail().x, sp = ImGui::GetStyle().ItemSpacing.x;
+    float avail = AvailW(), sp = ImGui::GetStyle().ItemSpacing.x;
     float w = (avail - sp * (n - 1)) / n;
     ImGui::PushID(id);
     for (int i = 0; i < n; i++) {
@@ -1015,7 +1031,7 @@ static bool Segmented(const char* id, const char* const* items, int n, int* sel)
 
 static bool SliderRow(const char* label, float* v, float lo, float hi, const char* fmt = "%.2f") {
     ImGui::TextUnformatted(label);
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - Gutter());
+    ImGui::SetNextItemWidth(AvailW() - Gutter());
     ImGui::PushID(label);
     bool ch = ImGui::SliderFloat("##s", v, lo, hi, fmt);
     if (ImGui::IsItemActive()) g_noScroll = true;
@@ -1050,7 +1066,8 @@ static void ApplyCustom(int slot, const RGB& c) {
     Template& cu = CustomT();
     if (!cu.hasC) { cu.c = cu.b; cu.hasC = true; }
     if (slot == 0) cu.a = c; else if (slot == 1) cu.b = c; else cu.c = c;
-    g_tpl = cu;
+    if (g_tpl.name == cu.name) g_tpl = cu;          // salinan aktif ikut diperbarui
+    else if (!SlotInUse(cu.name)) ChooseColor(cu);   // slot belum dipakai: langsung terapkan agar hasilnya terlihat
     g_uniVersion++;
 }
 
@@ -1069,7 +1086,7 @@ static void ColorRow(int slot, const char* label) {
     ImGui::GetWindowDrawList()->AddRect(p, ImVec2(p.x + sz, p.y + sz), picking ? IM_COL32(143, 92, 250, 255) : IM_COL32(255, 255, 255, 90), 10.0f * g_sc, 0, picking ? 4.0f : 2.0f);
     ImGui::SameLine();
     float bw = ImGui::GetFrameHeight() * 2.6f;
-    float fw = ImGui::GetContentRegionAvail().x - (bw * 2 + sp * 2);
+    float fw = AvailW() - (bw * 2 + sp * 2);
     std::string shown = editing ? ("#" + g_hexBuf + std::string(g_hexBuf.size() < 6 ? 6 - g_hexBuf.size() : 0, '_')) : ("#" + HexStr(cur));
     ImGui::PushStyleColor(ImGuiCol_Button, editing ? kAccent : kPanel);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, editing ? kAccent : kPanelHi);
@@ -1090,7 +1107,7 @@ static void ColorRow(int slot, const char* label) {
     }
     if (editing) {
         static const char* keys = "0123456789ABCDEF";
-        float kw = (ImGui::GetContentRegionAvail().x - sp * 7) / 8.0f, kh = ImGui::GetFrameHeight() * 1.35f;
+        float kw = (AvailW() - sp * 7) / 8.0f, kh = ImGui::GetFrameHeight() * 1.35f;
         for (int i = 0; i < 16; i++) {
             if (i % 8) ImGui::SameLine();
             char lb[2] = { keys[i], 0 };
@@ -1101,7 +1118,7 @@ static void ColorRow(int slot, const char* label) {
                 if (g_hexBuf.size() == 6 && ParseHexToken(g_hexBuf, c)) ApplyCustom(slot, c);
             }
         }
-        float kw4 = (ImGui::GetContentRegionAvail().x - sp * 3) / 4.0f;
+        float kw4 = (AvailW() - sp * 3) / 4.0f;
         if (Btn("Hapus", ImVec2(kw4, kh))) { if (g_hexFresh) { g_hexBuf.clear(); g_hexFresh = false; } else if (!g_hexBuf.empty()) g_hexBuf.pop_back(); }
         ImGui::SameLine();
         if (Btn("Bersih", ImVec2(kw4, kh))) { g_hexBuf.clear(); g_hexFresh = false; }
@@ -1122,7 +1139,7 @@ static void ColorRow(int slot, const char* label) {
         // picker RGB / HSV (inline, tanpa popup)
         RGB c0 = slot == 0 ? cu.a : (slot == 1 ? cu.b : (cu.hasC ? cu.c : cu.b));
         float col[3] = { c0.r / 255.0f, c0.g / 255.0f, c0.b / 255.0f };
-        float availW = ImGui::GetContentRegionAvail().x;
+        float availW = AvailW();
         float pickW = availW * 0.62f;
         if (pickW > availW - Gutter()) pickW = availW - Gutter();
         ImVec2 pk0 = ImGui::GetCursorScreenPos();
@@ -1141,7 +1158,7 @@ static void ColorRow(int slot, const char* label) {
         bool chg = false;
         for (int i = 0; i < 3; i++) {
             ImGui::PushID(100 + i);
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - Gutter());
+            ImGui::SetNextItemWidth(AvailW() - Gutter());
             chg |= ImGui::SliderInt("##rgb", &rgb[i], 0, 255, fm[i]);
             if (ImGui::IsItemActive()) g_noScroll = true;
             ImGui::PopID();
@@ -1163,234 +1180,429 @@ static int CurrentVehicleModel() {
     return (id >= 0 && id < 20000) ? id : -1;
 }
 
+// ================= antarmuka sederhana (v2) =================
+struct EffPreset { const char* name; const char* desc; float gain, flow, bias, depth, reflect, fresnel, flake, bright; };
+static const EffPreset kEffPresets[4] = {
+    {"Lembut",   "Perubahan warna halus dan natural.",            1.2f, 0.15f, 0.0f, 0.15f, 0.12f, 0.30f, 0.04f, 0.95f},
+    {"Standar",  "Seimbang, cocok untuk kebanyakan mobil.",       1.6f, 0.25f, 0.0f, 0.25f, 0.22f, 0.50f, 0.08f, 0.90f},
+    {"Kilap",    "Cat mengkilap seperti dipoles (clearcoat).",    1.8f, 0.30f, 0.0f, 0.30f, 0.38f, 0.65f, 0.10f, 0.90f},
+    {"Kontras",  "Warna lebih dalam dan berani.",                 2.4f, 0.35f, 0.0f, 0.45f, 0.30f, 0.60f, 0.12f, 0.85f},
+};
+static bool NearF(float a, float b) { float d = a - b; return (d < 0 ? -d : d) < 0.011f; }
+static int ActivePreset() {
+    for (int i = 0; i < 4; i++) {
+        const EffPreset& e = kEffPresets[i];
+        if (NearF(g_chamGain, e.gain) && NearF(g_chamFlow, e.flow) && NearF(g_chamBias, e.bias) && NearF(g_chamDepth, e.depth) &&
+            NearF(g_chamReflect, e.reflect) && NearF(g_chamFresnel, e.fresnel) && NearF(g_chamFlake, e.flake) && NearF(g_chamBright, e.bright)) return i;
+    }
+    return -1;
+}
+static void ApplyEffPreset(int i) {
+    const EffPreset& e = kEffPresets[i];
+    g_chamGain = e.gain; g_chamFlow = e.flow; g_chamBias = e.bias; g_chamDepth = e.depth;
+    g_chamReflect = e.reflect; g_chamFresnel = e.fresnel; g_chamFlake = e.flake; g_chamBright = e.bright;
+    g_uniVersion++;
+}
+static int LumClass(const Template& t) {   // 1 = gelap, 2 = sedang, 3 = terang
+    RGB c3 = t.hasC ? t.c : t.b;
+    float l = ((t.a.r + t.b.r + c3.r) * 0.299f + (t.a.g + t.b.g + c3.g) * 0.587f + (t.a.b + t.b.b + c3.b) * 0.114f) / (3.0f * 255.0f);
+    return l < 0.30f ? 1 : (l > 0.52f ? 3 : 2);
+}
+static const Template* TemplateByName(const std::string& n) { auto it = g_templates.find(n); return it == g_templates.end() ? nullptr : &it->second; }
+
+static void ChooseColor(const Template& t) {
+    std::string name = t.name;
+    if (IsCustomName(name)) g_curCustom = name;
+    if (g_scopeCar) {
+        if (g_curCar < 0) { Toast("Naiki mobil dulu untuk memberi warna khusus"); return; }
+        g_carsCfg[std::to_string(g_curCar)] = name;
+        g_needResolve = true;
+        Toast("Mobil " + std::to_string(g_curCar) + " memakai " + DisplayName(name));
+    } else {
+        auto it = g_templates.find(name);
+        g_tpl = (it != g_templates.end()) ? it->second : t;
+        Toast("Semua mobil memakai " + DisplayName(name));
+    }
+    g_uniVersion++;
+}
+
+static void RandomColor() {
+    std::vector<const Template*> list;
+    for (auto& kv : g_templates) if (!IsCustomName(kv.first)) list.push_back(&kv.second);
+    if (list.empty()) return;
+    ChooseColor(*list[(size_t)rand() % list.size()]);
+}
+
+static void Hint(const std::string& t) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.74f, 1.0f));
+    ImGui::TextWrapped("%s", t.c_str());
+    ImGui::PopStyleColor();
+}
+
+static float g_cardX = 0, g_cardY = 0, g_cardW = 0;
+static void CardBegin() {
+    float pad = 12.0f * g_sc;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    g_cardX = p.x; g_cardY = p.y; g_cardW = ImGui::GetContentRegionAvail().x;
+    ImGui::GetWindowDrawList()->ChannelsSplit(2);
+    ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
+    ImGui::BeginGroup();
+    ImGui::Dummy(ImVec2(1.0f, pad * 0.5f));
+    ImGui::Indent(pad);
+    g_rightPad = pad;
+}
+static void CardEnd() {
+    float pad = 12.0f * g_sc;
+    g_rightPad = 0.0f;
+    ImGui::Dummy(ImVec2(1.0f, pad * 0.4f));
+    ImGui::Unindent(pad);
+    ImGui::EndGroup();
+    ImVec2 mx = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSetCurrent(0);
+    dl->AddRectFilled(ImVec2(g_cardX, g_cardY), ImVec2(g_cardX + g_cardW, mx.y), IM_COL32(27, 27, 41, 255), 14.0f * g_sc);
+    dl->AddRect(ImVec2(g_cardX, g_cardY), ImVec2(g_cardX + g_cardW, mx.y), IM_COL32(255, 255, 255, 20), 14.0f * g_sc);
+    dl->ChannelsMerge();
+    ImGui::Dummy(ImVec2(1.0f, 6.0f * g_sc));
+}
+
+static void DrawTplBar(const Template& t, float h, const std::string& label) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = AvailW();
+    ImGui::Dummy(ImVec2(w, h));
+    DrawRamp(t, p, ImVec2(p.x + w, p.y + h), 12.0f * g_sc);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + h * 0.35f), ImVec2(p.x + w, p.y + h), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 175), IM_COL32(0, 0, 0, 175));
+    dl->AddText(ImVec2(p.x + 12.0f * g_sc, p.y + h - ImGui::GetTextLineHeight() - 7.0f * g_sc), IM_COL32(255, 255, 255, 255), label.c_str());
+}
+
+static bool SliderHelp(const char* label, const char* help, float* v, float lo, float hi) {
+    ImGui::TextUnformatted(label);
+    Hint(help);
+    ImGui::SetNextItemWidth(AvailW() - Gutter());
+    ImGui::PushID(label);
+    bool ch = ImGui::SliderFloat("##s", v, lo, hi, "%.2f");
+    if (ImGui::IsItemActive()) g_noScroll = true;
+    ImGui::PopID();
+    ImGui::Spacing();
+    return ch;
+}
+
+static const Template& EffectiveForScope() {
+    if (g_scopeCar && g_curCar >= 0) {
+        auto ex = g_carsCfg.find(std::to_string(g_curCar));
+        if (ex != g_carsCfg.end()) { const Template* t = TemplateByName(ex->second); if (t) return *t; }
+    }
+    return g_tpl;
+}
+
+// ---------------- TAB UTAMA ----------------
+static void TabUtama() {
+    float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
+    if (!g_tutorialDone) {
+        CardBegin();
+        ImGui::TextColored(kAccent2, "Selamat datang! Cara pakai:");
+        ImGui::TextWrapped("1. Buka tab Warna, lalu pilih warna yang kamu suka.");
+        ImGui::TextWrapped("2. Mau beda tiap mobil? Naiki mobilnya, buka tab Warna, lalu pilih \"Mobil ini saja\".");
+        ImGui::TextWrapped("3. Semua pengaturan tersimpan otomatis.");
+        ImGui::Spacing();
+        if (Btn("Mengerti, tutup panduan", ImVec2(AvailW(), bh))) g_tutorialDone = true;
+        CardEnd();
+    }
+
+    CardBegin();
+    ToggleRow("Efek chameleon", &g_enabled);
+    Hint(g_enabled ? "Aktif. Matikan untuk melihat warna asli mobil." : "Mati. Mobil tampil dengan warna aslinya.");
+    CardEnd();
+
+    CardBegin();
+    ImGui::TextColored(kAccent2, "Warna untuk semua mobil");
+    DrawTplBar(g_tpl, ImGui::GetFrameHeight() * 1.8f, DisplayName(g_tpl.name));
+    float bw = (AvailW() - sp) / 2.0f;
+    if (Btn("Ganti warna", ImVec2(bw, bh))) { g_scopeCar = false; g_tab = 1; }
+    ImGui::SameLine();
+    if (Btn("Acak", ImVec2(bw, bh))) { g_scopeCar = false; RandomColor(); }
+    CardEnd();
+
+    CardBegin();
+    ImGui::TextColored(kAccent2, "Mobil yang sedang dikendarai");
+    if (g_curCar >= 0) {
+        ImGui::Text("Model: %d", g_curCar);
+        auto ex = g_carsCfg.find(std::to_string(g_curCar));
+        if (ex != g_carsCfg.end()) {
+            const Template* t = TemplateByName(ex->second);
+            if (t) DrawTplBar(*t, ImGui::GetFrameHeight() * 1.5f, "Warna khusus: " + DisplayName(ex->second));
+            float b2 = (AvailW() - sp) / 2.0f;
+            if (Btn("Ganti warna", ImVec2(b2, bh))) { g_scopeCar = true; g_tab = 1; }
+            ImGui::SameLine();
+            if (Btn("Hapus warna khusus", ImVec2(b2, bh))) { g_carsCfg.erase(ex); g_needResolve = true; Toast("Warna khusus mobil ini dihapus"); }
+        } else {
+            Hint(g_whitelist ? "Mobil ini belum diberi warna, jadi tampil normal." : "Mobil ini memakai warna umum.");
+            if (Btn("Beri warna khusus", ImVec2(AvailW(), bh))) { g_scopeCar = true; g_tab = 1; }
+        }
+    } else {
+        Hint("Naiki sebuah mobil untuk memberinya warna khusus.");
+    }
+    CardEnd();
+
+    CardBegin();
+    ImGui::TextColored(kAccent2, "Gaya efek");
+    {
+        float w = (AvailW() - sp * 3) / 4.0f;
+        int act = ActivePreset();
+        for (int i = 0; i < 4; i++) {
+            if (i) ImGui::SameLine();
+            bool on = (act == i);
+            ImGui::PushStyleColor(ImGuiCol_Button, on ? kAccent : kPanel);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? kAccent : kPanelHi);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccent2);
+            if (Btn(kEffPresets[i].name, ImVec2(w, bh))) { ApplyEffPreset(i); Toast(std::string("Gaya ") + kEffPresets[i].name + " diterapkan"); }
+            ImGui::PopStyleColor(3);
+        }
+        Hint(act >= 0 ? kEffPresets[act].desc : "Pengaturan kustom. Atur detailnya di tab Efek.");
+    }
+    CardEnd();
+}
+
+// ---------------- TAB WARNA ----------------
 static void TabWarna() {
     float sp = ImGui::GetStyle().ItemSpacing.x;
-    // pratinjau template aktif
+    float bh = ImGui::GetFrameHeight() * 1.3f;
+    SectionTitle("ATUR WARNA UNTUK");
+    static const char* kScope[] = {"Semua mobil", "Mobil ini saja"};
+    int sc = g_scopeCar ? 1 : 0;
+    if (Segmented("scope", kScope, 2, &sc)) g_scopeCar = (sc == 1);
+    if (g_scopeCar) Hint(g_curCar >= 0 ? "Pilihan di bawah hanya berlaku untuk mobil yang sedang kamu kendarai (model " + std::to_string(g_curCar) + ")."
+                                       : "Naiki sebuah mobil dulu agar bisa memilih warna khusus untuk mobil itu.");
+    else Hint("Pilihan di bawah berlaku untuk semua mobil yang tidak punya warna khusus.");
+    ImGui::Spacing();
+    const Template& eff = EffectiveForScope();
+    DrawTplBar(eff, ImGui::GetFrameHeight() * 2.0f, "Dipakai: " + DisplayName(eff.name));
+
+    SectionTitle("WARNA SIAP PAKAI");
+    static const char* kF[] = {"Semua", "Gelap", "Sedang", "Terang"};
+    Segmented("flt", kF, 4, &g_filter);
+    if (Btn("Acak warna", ImVec2(AvailW(), bh))) RandomColor();
+    ImGui::Spacing();
     {
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetFrameHeight() * 2.2f;
-        ImGui::Dummy(ImVec2(w, h));
-        DrawRamp(g_tpl, p, ImVec2(p.x + w, p.y + h), 14.0f * g_sc);
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilledMultiColor(ImVec2(p.x, p.y + h * 0.4f), ImVec2(p.x + w, p.y + h), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
-        std::string nm = DisplayName(g_tpl.name);
-        dl->AddText(ImVec2(p.x + 12.0f * g_sc, p.y + h - ImGui::GetTextLineHeight() - 8.0f * g_sc), IM_COL32(255, 255, 255, 255), nm.c_str());
-    }
-    SectionTitle("TEMPLATE");
-    {
-        float cw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, ch = ImGui::GetFrameHeight() * 2.1f;
-        std::vector<const Template*> list;
-        for (int i2 = 0; i2 < 8; i2++) { auto cu = g_templates.find(CustomName(i2)); if (cu != g_templates.end()) list.push_back(&cu->second); }
-        for (auto& kv : g_templates) if (!IsCustomName(kv.first)) list.push_back(&kv.second);
+        float cw = (AvailW() - sp) / 2.0f, ch = ImGui::GetFrameHeight() * 2.1f;
         int idx = 0;
-        for (const Template* t : list) {
+        for (auto& kv : g_templates) {
+            if (IsCustomName(kv.first)) continue;
+            if (g_filter != 0 && LumClass(kv.second) != g_filter) continue;
             if (idx % 2 == 1) ImGui::SameLine();
-            std::string title = IsCustomName(t->name) ? DisplayName(t->name) : t->name;
-            if (TemplateCard(title, *t, t->name == g_tpl.name, cw, ch)) { g_tpl = *t; if (IsCustomName(t->name)) g_curCustom = t->name; }
+            if (TemplateCard(kv.first, kv.second, kv.first == eff.name, cw, ch)) ChooseColor(kv.second);
             idx++;
         }
+        if (idx == 0) Hint("Tidak ada warna pada kategori ini.");
     }
-    SectionTitle("MIX MANUAL / KODE WARNA");
+
+    SectionTitle("WARNA BUATAN SAYA");
+    Hint("Ada 8 tempat penyimpanan. Tiap mobil bisa memakai tempat yang berbeda. Ketuk salah satu untuk dipakai dan diedit.");
     {
-        ImGui::TextWrapped("Pilih slot custom. Tiap slot menyimpan 3 warna sendiri, jadi bisa dipakai mobil yang berbeda (atur di tab Mobil).");
-        static const char* kSl[] = {"1", "2", "3", "4", "5", "6", "7", "8"};
-        int si = 0; IsCustomName(g_curCustom, &si);
-        if (Segmented("csl", kSl, 8, &si)) { g_curCustom = CustomName(si); g_tpl = CustomT(); g_editSlot = -1; g_pickSlot = -1; g_uniVersion++; }
-        ImGui::Text("Sedang diedit: %s", DisplayName(g_curCustom).c_str());
-        ImGui::Spacing();
+        float cw = (AvailW() - sp * 3) / 4.0f, ch = ImGui::GetFrameHeight() * 1.7f;
+        for (int i = 0; i < 8; i++) {
+            if (i % 4) ImGui::SameLine();
+            std::string n = CustomName(i);
+            const Template* t = TemplateByName(n);
+            if (!t) continue;
+            if (TemplateCard("Custom " + std::to_string(i + 1), *t, n == eff.name, cw, ch)) ChooseColor(*t);
+        }
     }
-    ImGui::TextWrapped("Ketuk KOTAK WARNA untuk membuka picker RGB. Ketuk KOLOM KODE untuk mengetik hex (keypad). Tempel/Salin memakai clipboard (#RRGGBB, RGB, atau 120,40,200).");
     ImGui::Spacing();
-    ColorRow(0, "Warna A (menghadap kamera)");
-    ColorRow(1, "Warna B (tengah)");
-    ColorRow(2, "Warna C (tepi)");
     {
-        float bw = (ImGui::GetContentRegionAvail().x - sp * 2) / 3.0f, bh = ImGui::GetFrameHeight() * 1.3f;
+        const Template& cu = CustomT();
+        std::string used;
+        if (g_tpl.name == cu.name) used = "semua mobil";
+        for (auto& kv : g_carsCfg) if (kv.second == cu.name) used += (used.empty() ? "" : ", ") + std::string("mobil ") + kv.first;
+        SectionTitle(("EDIT " + DisplayName(g_curCustom)).c_str());
+        Hint(used.empty() ? "Belum dipakai. Ketuk kartunya di atas, atau ubah warnanya di sini agar langsung diterapkan."
+                          : "Sedang dipakai: " + used + ".");
+    }
+    ImGui::Spacing();
+    ColorRow(0, "Warna 1 - saat menghadap kamera");
+    ColorRow(1, "Warna 2 - peralihan");
+    ColorRow(2, "Warna 3 - saat miring / di tepi");
+    Hint("Ketuk kotak warna untuk picker, atau ketuk kolom kode untuk mengetik hex. Tempel/Salin memakai clipboard (#RRGGBB, RGB, atau 120,40,200).");
+    ImGui::Spacing();
+    {
+        float bw = (AvailW() - sp * 2) / 3.0f;
         Template& cu = CustomT();
-        if (Btn("Salin palet", ImVec2(bw, bh))) {
+        if (Btn("Salin 3 warna", ImVec2(bw, bh))) {
             RGB c3 = cu.hasC ? cu.c : cu.b;
-            Toast(ClipboardSet("#" + HexStr(cu.a) + " #" + HexStr(cu.b) + " #" + HexStr(c3)) ? "Palet disalin" : "Clipboard tidak tersedia");
+            Toast(ClipboardSet("#" + HexStr(cu.a) + " #" + HexStr(cu.b) + " #" + HexStr(c3)) ? "3 warna disalin" : "Clipboard tidak tersedia");
         }
         ImGui::SameLine();
-        if (Btn("Tempel palet", ImVec2(bw, bh))) {
+        if (Btn("Tempel 3 warna", ImVec2(bw, bh))) {
             RGB pal[3];
             int n = ParsePalette(ClipboardGet(), pal);
-            if (n >= 2) { for (int i = 0; i < n; i++) ApplyCustom(i, pal[i]); Toast("Palet ditempel"); }
-            else Toast("Format palet: #RRGGBB #RRGGBB #RRGGBB");
+            if (n >= 2) { for (int i = 0; i < n; i++) ApplyCustom(i, pal[i]); Toast("3 warna ditempel"); }
+            else Toast("Format: #RRGGBB #RRGGBB #RRGGBB");
         }
         ImGui::SameLine();
-        if (Btn("Salin dari aktif", ImVec2(bw, bh))) {
-            if (g_tpl.name != g_curCustom) { Template src = g_tpl; ApplyCustom(0, src.a); ApplyCustom(1, src.b); ApplyCustom(2, src.hasC ? src.c : src.b); g_tpl = CustomT(); Toast("Template disalin ke " + DisplayName(g_curCustom)); }
-        }
-    }
-    SectionTitle("SLOT PRESET");
-    {
-        static const char* pm[] = {"Muat", "Simpan"};
-        Segmented("pm", pm, 2, &g_presetMode);
-        ImGui::Spacing();
-        float cw = (ImGui::GetContentRegionAvail().x - sp * 2) / 3.0f, ch = ImGui::GetFrameHeight() * 1.9f;
-        for (int i = 0; i < 6; i++) {
-            if (i % 3) ImGui::SameLine();
-            PresetSlot& ps = g_presets[i];
-            char nm[32]; snprintf(nm, sizeof nm, "Slot %d", i + 1);
-            bool tap;
-            if (ps.used) {
-                Template tmp; tmp.name = nm; tmp.a = ps.a; tmp.b = ps.b; tmp.c = ps.c; tmp.hasC = true;
-                tap = TemplateCard(nm, tmp, false, cw, ch);
-            } else {
-                ImVec2 p = ImGui::GetCursorScreenPos();
-                tap = ImGui::InvisibleButton(nm, ImVec2(cw, ch)) && !Dragged();
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->AddRectFilled(p, ImVec2(p.x + cw, p.y + ch), IM_COL32(40, 40, 54, 255), 12.0f * g_sc);
-                dl->AddRect(p, ImVec2(p.x + cw, p.y + ch), IM_COL32(110, 110, 140, 255), 12.0f * g_sc, 0, 2.0f);
-                std::string t = std::string(nm) + " (kosong)";
-                dl->AddText(ImVec2(p.x + 10.0f * g_sc, p.y + ch * 0.5f - ImGui::GetTextLineHeight() * 0.5f), IM_COL32(170, 170, 200, 255), t.c_str());
-            }
-            if (tap) {
-                Template& cu = CustomT();
-                if (g_presetMode == 1) {
-                    ps.used = true; ps.a = cu.a; ps.b = cu.b; ps.c = cu.hasC ? cu.c : cu.b;
-                    Toast(std::string("Custom disimpan ke ") + nm);
-                } else if (ps.used) {
-                    ApplyCustom(0, ps.a); ApplyCustom(1, ps.b); ApplyCustom(2, ps.c);
-                    Toast(std::string(nm) + " dimuat ke custom");
-                }
-            }
+        if (Btn("Mulai dari warna terpilih", ImVec2(bw, bh))) {
+            Template src = eff;
+            if (src.name != cu.name) { ApplyCustom(0, src.a); ApplyCustom(1, src.b); ApplyCustom(2, src.hasC ? src.c : src.b); Toast("Warna terpilih disalin ke " + DisplayName(g_curCustom)); }
         }
     }
 }
 
+// ---------------- TAB EFEK ----------------
 static void TabEfek() {
+    float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
+    SectionTitle("GAYA CEPAT");
     {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.26f, 0.38f, 1.0f));
-        if (Btn("Kembalikan efek ke default", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.4f))) { ResetEffects(); Toast("Efek dikembalikan ke default"); }
-        ImGui::PopStyleColor(2);
+        float w = (AvailW() - sp * 3) / 4.0f;
+        int act = ActivePreset();
+        for (int i = 0; i < 4; i++) {
+            if (i) ImGui::SameLine();
+            bool on = (act == i);
+            ImGui::PushStyleColor(ImGuiCol_Button, on ? kAccent : kPanel);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? kAccent : kPanelHi);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccent2);
+            if (Btn(kEffPresets[i].name, ImVec2(w, bh))) { ApplyEffPreset(i); Toast(std::string("Gaya ") + kEffPresets[i].name + " diterapkan"); }
+            ImGui::PopStyleColor(3);
+        }
+        Hint(act >= 0 ? kEffPresets[act].desc : "Pengaturan kustom (sudah kamu ubah manual).");
     }
-    SectionTitle("MODE");
-    static const char* kModes[] = {"Pixel", "Sudut", "Waktu", "Gabungan"};
-    static const int kModeVal[] = {3, 0, 1, 2};
-    int mi = 0;
-    for (int i = 0; i < 4; i++) if (kModeVal[i] == g_shiftMode) mi = i;
-    if (Segmented("mode", kModes, 4, &mi)) g_shiftMode = kModeVal[mi];
-    if (g_shiftMode == 3 && !g_shaderOK) ImGui::TextWrapped("Pixel belum aktif (shader_patch=0 atau hook gagal), dipakai mode sudut.");
-
-    SectionTitle("EFEK PER PIKSEL (live)");
+    SectionTitle("ATUR SENDIRI");
     bool ch = false;
-    ch |= SliderRow("Gain sudut", &g_chamGain, 0.2f, 4.0f);
-    ch |= SliderRow("Aliran pantulan", &g_chamFlow, -1.0f, 1.0f);
-    ch |= SliderRow("Geser awal", &g_chamBias, -0.6f, 0.6f);
-    ch |= SliderRow("Kedalaman", &g_chamDepth, 0.0f, 0.8f);
-    ch |= SliderRow("Kilap minimum", &g_chamReflect, 0.0f, 0.6f);
-    ch |= SliderRow("Fresnel", &g_chamFresnel, 0.0f, 1.0f);
-    ch |= SliderRow("Glitter", &g_chamFlake, 0.0f, 0.5f);
-    ch |= SliderRow("Kecerahan", &g_chamBright, 0.3f, 1.5f);
+    ch |= SliderHelp("Kecepatan ganti warna", "Makin besar, warna makin cepat berubah saat sudut pandang berubah.", &g_chamGain, 0.2f, 4.0f);
+    ch |= SliderHelp("Kilap dasar", "Seberapa mengkilap catnya (pantulan lingkungan).", &g_chamReflect, 0.0f, 0.6f);
+    ch |= SliderHelp("Kilap di tepi", "Tambahan kilap pada sisi bodi yang melengkung.", &g_chamFresnel, 0.0f, 1.0f);
+    ch |= SliderHelp("Kedalaman warna", "Makin besar, warna dasar makin gelap dan dalam.", &g_chamDepth, 0.0f, 0.8f);
+    ch |= SliderHelp("Butiran metalik", "Butiran halus berkilau pada cat. 0 untuk mematikan.", &g_chamFlake, 0.0f, 0.5f);
+    ch |= SliderHelp("Kecerahan", "Kecerahan keseluruhan warna. Turunkan jika terlalu pucat.", &g_chamBright, 0.3f, 1.5f);
     if (ch) g_uniVersion++;
 
-    SectionTitle("MODE SUDUT / WAKTU");
-    SliderRow("Gain sudut keliling", &g_angleGain, 0.5f, 6.0f);
-    SliderRow("Gain elevasi", &g_elevGain, 0.0f, 4.0f);
-    SliderRow("Beda antar bagian", &g_partSpread, 0.0f, 6.0f);
-    SliderRow("Kecepatan (waktu)", &g_speed, 0.0f, 3.0f);
-    SliderRow("Intensitas", &g_intensity, 0.0f, 1.0f);
-    ImGui::Spacing();
+    SectionTitle("LANJUTAN");
+    if (Btn(g_advanced ? "Sembunyikan pengaturan lanjutan" : "Tampilkan pengaturan lanjutan", ImVec2(AvailW(), bh))) g_advanced = !g_advanced;
+    if (g_advanced) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Teknik efek");
+        static const char* kModes[] = {"Pixel", "Sudut", "Waktu", "Gabungan"};
+        static const int kModeVal[] = {3, 0, 1, 2};
+        static const char* kModeHelp[] = {
+            "Pixel: warna dihitung per piksel, paling realistis (disarankan).",
+            "Sudut: warna tiap bagian bodi mengikuti sudut kamera.",
+            "Waktu: warna berubah pelan seiring waktu.",
+            "Gabungan: sudut kamera ditambah perubahan waktu." };
+        int mi = 0;
+        for (int i = 0; i < 4; i++) if (kModeVal[i] == g_shiftMode) mi = i;
+        if (Segmented("mode", kModes, 4, &mi)) g_shiftMode = kModeVal[mi];
+        Hint(kModeHelp[mi]);
+        if (g_shiftMode == 3 && !g_shaderOK) Hint("Pixel belum aktif (shader_patch=0 atau hook gagal), sementara dipakai mode Sudut.");
+        ImGui::Spacing();
+        bool c2 = false;
+        c2 |= SliderHelp("Pengaruh pantulan atas/bawah", "Menggeser warna menurut arah pantulan langit dan tanah.", &g_chamFlow, -1.0f, 1.0f);
+        c2 |= SliderHelp("Geser awal gradasi", "Memajukan atau memundurkan titik awal perubahan warna.", &g_chamBias, -0.6f, 0.6f);
+        if (c2) g_uniVersion++;
+        SliderHelp("Mode sudut: gain keliling", "Jumlah pergantian warna saat mengelilingi mobil.", &g_angleGain, 0.5f, 6.0f);
+        SliderHelp("Mode sudut: gain atas/bawah", "Pengaruh sudut kamera dari atas atau bawah.", &g_elevGain, 0.0f, 4.0f);
+        SliderHelp("Mode sudut: beda antar bagian", "Perbedaan warna antara kap, pintu, bumper, dan lainnya.", &g_partSpread, 0.0f, 6.0f);
+        SliderHelp("Mode waktu: kecepatan", "Kecepatan perubahan warna terhadap waktu.", &g_speed, 0.0f, 3.0f);
+        SliderHelp("Intensitas keseluruhan", "Kekuatan perpindahan antar warna.", &g_intensity, 0.0f, 1.0f);
+    }
+    SectionTitle("KEMBALIKAN");
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.26f, 0.38f, 1.0f));
-    if (Btn("Kembalikan efek ke default ", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.4f))) { ResetEffects(); Toast("Efek dikembalikan ke default"); }
+    if (Btn("Kembalikan efek ke default", ImVec2(AvailW(), bh))) { ResetEffects(); Toast("Efek dikembalikan ke default"); }
     ImGui::PopStyleColor(2);
 }
 
+// ---------------- TAB MOBIL ----------------
 static void TabMobil() {
-    SectionTitle("TARGET");
-    static const char* kTg[] = {"Semua mobil", "Hanya terdaftar"};
-    int tg = g_whitelist ? 1 : 0;
-    if (Segmented("tg", kTg, 2, &tg)) g_whitelist = (tg == 1);
+    float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
+    SectionTitle("MOBIL LAIN");
+    bool others = !g_whitelist;
+    if (ToggleRow("Mobil lain ikut berwarna", &others)) g_whitelist = !others;
+    Hint(others ? "Semua mobil berwarna chameleon. Mobil di daftar bawah memakai warna khususnya."
+                : "Hanya mobil di daftar bawah yang berwarna chameleon. Mobil lain tampil normal.");
+
     SectionTitle("MOBIL YANG DIKENDARAI");
-    int cur = CurrentVehicleModel();
-    if (cur >= 0) {
-        ImGui::Text("Model ID: %d", cur);
-        float sp = ImGui::GetStyle().ItemSpacing.x;
-        float bw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, bh = ImGui::GetFrameHeight() * 1.3f;
-        if (Btn("Daftarkan (template aktif)", ImVec2(bw, bh))) { g_carsCfg[std::to_string(cur)] = g_tpl.name; g_needResolve = true; Toast("Mobil didaftarkan"); }
-        ImGui::SameLine();
-        if (Btn("Hapus dari daftar", ImVec2(bw, bh))) { g_carsCfg.erase(std::to_string(cur)); g_needResolve = true; Toast("Mobil dihapus"); }
-        if (Btn("Warna custom khusus mobil ini", ImVec2(ImGui::GetContentRegionAvail().x, bh))) {
-            auto ex = g_carsCfg.find(std::to_string(cur));
-            if (ex != g_carsCfg.end() && IsCustomName(ex->second)) {
-                g_curCustom = ex->second; g_tpl = CustomT(); g_tab = 0; g_uniVersion++;
-                Toast("Edit warna " + DisplayName(g_curCustom));
-            } else {
-                int freeSlot = -1;
-                for (int i = 0; i < 8 && freeSlot < 0; i++) {
-                    std::string n = CustomName(i); bool used = false;
-                    for (auto& kv : g_carsCfg) if (kv.second == n) used = true;
-                    if (!used) freeSlot = i;
-                }
-                if (freeSlot < 0) Toast("Semua 8 slot custom sudah dipakai mobil lain");
-                else {
-                    std::string n = CustomName(freeSlot);
-                    Template src = g_tpl;
-                    Template& dst = g_templates[n];
-                    dst.name = n; dst.a = src.a; dst.b = src.b; dst.c = src.hasC ? src.c : src.b; dst.hasC = true;
-                    g_carsCfg[std::to_string(cur)] = n; g_needResolve = true;
-                    g_curCustom = n; g_tpl = dst; g_tab = 0; g_uniVersion++;
-                    Toast("Mobil ini memakai " + DisplayName(n) + " - atur warnanya di tab Warna");
-                }
-            }
+    if (g_curCar >= 0) {
+        ImGui::Text("Model: %d", g_curCar);
+        auto ex = g_carsCfg.find(std::to_string(g_curCar));
+        float b2 = (AvailW() - sp) / 2.0f;
+        if (ex == g_carsCfg.end()) {
+            if (Btn("Beri warna khusus", ImVec2(AvailW(), bh))) { g_scopeCar = true; g_tab = 1; }
+        } else {
+            if (Btn("Ganti warna", ImVec2(b2, bh))) { g_scopeCar = true; g_tab = 1; }
+            ImGui::SameLine();
+            if (Btn("Hapus dari daftar", ImVec2(b2, bh))) { g_carsCfg.erase(ex); g_needResolve = true; Toast("Mobil dihapus dari daftar"); }
         }
     } else {
-        ImGui::TextWrapped("Naiki sebuah mobil untuk mendaftarkannya.");
+        Hint("Naiki sebuah mobil untuk mengatur warna khususnya.");
     }
-    SectionTitle("DAFTAR MOBIL");
-    if (g_carsCfg.empty()) ImGui::TextWrapped("Belum ada mobil terdaftar.");
+
+    SectionTitle("DAFTAR MOBIL BERWARNA KHUSUS");
+    if (g_carsCfg.empty()) Hint("Belum ada. Naiki mobil, buka tab Warna, lalu pilih \"Mobil ini saja\".");
     std::string del;
     for (auto& kv : g_carsCfg) {
         ImGui::PushID(kv.first.c_str());
-        if (Btn("X", ImVec2(ImGui::GetFrameHeight() * 1.3f, ImGui::GetFrameHeight() * 1.2f))) del = kv.first;
-        ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::Text("%s  ->  %s", kv.first.c_str(), DisplayName(kv.second).c_str());
+        CardBegin();
+        ImGui::Text("Mobil: %s%s", kv.first.c_str(), (std::to_string(g_curCar) == kv.first) ? "  (sedang dikendarai)" : "");
+        const Template* t = TemplateByName(kv.second);
+        if (t) DrawTplBar(*t, ImGui::GetFrameHeight() * 1.4f, DisplayName(kv.second));
+        else Hint("Warna tidak ditemukan: " + kv.second);
+        float b3 = (AvailW() - sp * 2) / 3.0f;
         if (IsCustomName(kv.second)) {
-            ImGui::SameLine();
-            if (Btn("Edit", ImVec2(ImGui::GetFrameHeight() * 2.0f, ImGui::GetFrameHeight() * 1.2f))) { g_curCustom = kv.second; g_tpl = CustomT(); g_tab = 0; g_uniVersion++; }
+            if (Btn("Edit warna", ImVec2(b3, bh))) { g_curCustom = kv.second; g_scopeCar = false; g_tab = 1; g_uniVersion++; }
+        } else {
+            ImGui::BeginDisabled();
+            Btn("Edit warna", ImVec2(b3, bh));
+            ImGui::EndDisabled();
         }
+        ImGui::SameLine();
+        if (Btn("Pakai warna umum", ImVec2(b3, bh))) { kv.second = g_tpl.name; g_needResolve = true; Toast("Mobil memakai warna umum yang aktif"); }
+        ImGui::SameLine();
+        if (Btn("Hapus", ImVec2(b3, bh))) del = kv.first;
+        CardEnd();
         ImGui::PopID();
     }
-    if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; }
+    if (!del.empty()) { g_carsCfg.erase(del); g_needResolve = true; Toast("Mobil dihapus dari daftar"); }
 }
 
+// ---------------- TAB LAINNYA ----------------
 static void TabSistem() {
+    float bh = ImGui::GetFrameHeight() * 1.3f, sp = ImGui::GetStyle().ItemSpacing.x;
     SectionTitle("PENYIMPANAN");
     ToggleRow("Simpan otomatis", &g_autoSave);
-    ImGui::TextWrapped("Semua pengaturan (template, warna custom, slider, daftar mobil, preset) tersimpan otomatis ke pearlescent.ini sehingga tidak perlu diatur ulang.");
+    Hint("Semua pengaturan tersimpan otomatis ke pearlescent.ini, jadi tidak perlu diatur ulang saat main lagi.");
     ImGui::Spacing();
-    float sp = ImGui::GetStyle().ItemSpacing.x;
-    float bw = (ImGui::GetContentRegionAvail().x - sp) / 2.0f, bh = ImGui::GetFrameHeight() * 1.3f;
+    float bw = (AvailW() - sp) / 2.0f;
     if (Btn("Simpan sekarang", ImVec2(bw, bh))) { SaveConfig(); g_hashInit = false; Toast("Pengaturan disimpan"); }
     ImGui::SameLine();
-    if (Btn("Muat ulang dari ini", ImVec2(bw, bh))) { LoadConfig(); g_uniVersion++; Toast("Pengaturan dimuat ulang"); }
-    SectionTitle("TOMBOL MENU");
-    SliderRow("Posisi X", &g_btnX, 0.0f, 0.95f);
-    SliderRow("Posisi Y", &g_btnY, 0.0f, 0.9f);
-    SliderRow("Transparansi tombol (kecil = lebih transparan)", &g_btnAlpha, 0.10f, 1.0f);
-    SliderRow("Transparansi panel menu", &g_panelAlpha, 0.40f, 1.0f);
-    SectionTitle("RESET GLOBAL");
-    ImGui::TextWrapped("Mengembalikan SEMUA pengaturan ke setelan awal: efek, mode, warna custom, preset, daftar mobil, posisi dan transparansi tombol.");
+    if (Btn("Muat ulang dari file", ImVec2(bw, bh))) { LoadConfig(); g_uniVersion++; Toast("Pengaturan dimuat ulang"); }
+
+    SectionTitle("TAMPILAN MENU");
+    SliderHelp("Posisi tombol (kiri-kanan)", "Geser tombol PC agar tidak menghalangi layar.", &g_btnX, 0.0f, 0.95f);
+    SliderHelp("Posisi tombol (atas-bawah)", "Geser tombol PC ke atas atau bawah.", &g_btnY, 0.0f, 0.9f);
+    SliderHelp("Transparansi tombol", "Kiri = hampir transparan, kanan = solid.", &g_btnAlpha, 0.10f, 1.0f);
+    SliderHelp("Transparansi panel menu", "Membuat panel menu menembus pandang.", &g_panelAlpha, 0.40f, 1.0f);
+
+    SectionTitle("BANTUAN");
+    if (Btn("Tampilkan panduan lagi", ImVec2(AvailW(), bh))) { g_tutorialDone = false; g_tab = 0; Toast("Panduan ditampilkan di tab Utama"); }
+    Hint("Tips: geser jari di area kosong sebelah kanan untuk menggulir menu. Ketuk X di kanan atas untuk menutup menu.");
+
+    SectionTitle("RESET TOTAL");
+    Hint("Mengembalikan SEMUA pengaturan ke setelan awal: efek, warna buatan, daftar mobil, posisi dan transparansi tombol.");
     {
         static double confirmT = -10.0;
         bool armed = (NowSec() - confirmT) < 3.0;
         ImGui::PushStyleColor(ImGuiCol_Button, armed ? ImVec4(0.80f, 0.20f, 0.25f, 1.0f) : ImVec4(0.55f, 0.20f, 0.30f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.26f, 0.32f, 1.0f));
-        if (Btn(armed ? "Ketuk lagi untuk KONFIRMASI reset" : "Kembalikan semua ke setelan awal", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.5f))) {
+        if (Btn(armed ? "Ketuk lagi untuk KONFIRMASI" : "Kembalikan semua ke setelan awal", ImVec2(AvailW(), bh * 1.15f))) {
             if (armed) { ResetAll(); confirmT = -10.0; Toast("Semua pengaturan dikembalikan ke setelan awal"); }
             else confirmT = NowSec();
         }
         ImGui::PopStyleColor(2);
     }
+
     SectionTitle("STATUS");
-    ImGui::TextWrapped("Shader per-piksel: %s", g_shaderOK ? "aktif" : "tidak aktif");
-    ImGui::TextWrapped("Template: %d | Palet shader: %d", (int)g_templates.size(), (int)g_palette.size());
-    ImGui::TextWrapped("Config: %s", g_iniPath.c_str());
+    Hint(std::string("Shader per-piksel: ") + (g_shaderOK ? "aktif" : "tidak aktif"));
+    Hint("Template: " + std::to_string((int)g_templates.size()) + " | Palet shader: " + std::to_string((int)g_palette.size()));
+    Hint("File: " + g_iniPath);
 }
 
 static void DrawToast(float W, float H) {
@@ -1455,21 +1667,23 @@ static void BuildUI(float W, float H) {
         if (Btn("X", ImVec2(xw, ImGui::GetFrameHeight() * 0.95f))) g_menuOpen = false;
         {
             ImVec2 p = ImGui::GetCursorScreenPos();
-            float w = ImGui::GetContentRegionAvail().x;
+            float w = AvailW();
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->AddRectFilledMultiColor(p, ImVec2(p.x + w * 0.5f, p.y + 3.0f * g_sc), ImGui::GetColorU32(kAccent), ImGui::GetColorU32(kAccent2), ImGui::GetColorU32(kAccent2), ImGui::GetColorU32(kAccent));
             dl->AddRectFilledMultiColor(ImVec2(p.x + w * 0.5f, p.y), ImVec2(p.x + w, p.y + 3.0f * g_sc), ImGui::GetColorU32(kAccent2), IM_COL32(255, 90, 170, 255), IM_COL32(255, 90, 170, 255), ImGui::GetColorU32(kAccent2));
             ImGui::Dummy(ImVec2(w, 3.0f * g_sc));
         }
         ImGui::Spacing();
-        static const char* kTabs[] = {"Warna", "Efek", "Mobil", "Sistem"};
-        Segmented("tabs", kTabs, 4, &g_tab);
+        g_curCar = CurrentVehicleModel();
+        static const char* kTabs[] = {"Utama", "Warna", "Efek", "Mobil", "Lainnya"};
+        Segmented("tabs", kTabs, 5, &g_tab);
         ImGui::Spacing();
         ImGui::BeginChild("##content", ImVec2(0, 0), 0, 0);
         switch (g_tab) {
-            case 0: TabWarna(); break;
-            case 1: TabEfek(); break;
-            case 2: TabMobil(); break;
+            case 0: TabUtama(); break;
+            case 1: TabWarna(); break;
+            case 2: TabEfek(); break;
+            case 3: TabMobil(); break;
             default: TabSistem(); break;
         }
         ImGui::Dummy(ImVec2(0, ImGui::GetFrameHeight()));
