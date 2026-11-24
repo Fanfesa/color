@@ -249,6 +249,11 @@ static UiRect g_uiRects[3] = { {0, 0, 0, 0, false}, {0, 0, 0, 0, false}, {0, 0, 
 static bool  g_autoSave = true;
 static bool  g_tutorialDone = false;       // panduan awal sudah ditutup
 static bool  g_debugLog = false;           // ini: debug_log (log rinci per kendaraan/shader)
+static bool  g_crashGuard = true;          // ini: crash_guard (lewati panggilan RpClumpForAllAtomics dengan clump NULL)
+static bool  g_aa = false;                 // anti-aliasing (FXAA) aktif
+static int   g_aaQuality = 1;              // 0 rendah, 1 sedang, 2 tinggi
+static float g_aaStrength = 1.0f;          // 0.1 - 1.0
+static bool  g_aaFailed = false;           // AA tidak didukung perangkat
 static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
 static PresetSlot g_presets[6];
@@ -332,7 +337,8 @@ static void LoadConfig() {
     float angleGain = g_angleGain, elevGain = g_elevGain, partSpread = g_partSpread;
     float chamGain = g_chamGain, chamFlow = g_chamFlow, chamBias = g_chamBias;
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
-    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone, debugV = g_debugLog;
+    bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone, debugV = g_debugLog, aaV = g_aa, guardV = g_crashGuard;
+    int aaQ = g_aaQuality; float aaS = g_aaStrength;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
@@ -381,6 +387,10 @@ static void LoadConfig() {
             else if (k == "autosave") autoSaveV = (atoi(v.c_str()) != 0);
             else if (k == "tutorial_done") tutorialV = (atoi(v.c_str()) != 0);
             else if (k == "debug_log") debugV = (atoi(v.c_str()) != 0);
+            else if (k == "crash_guard") guardV = (atoi(v.c_str()) != 0);
+            else if (k == "aa") aaV = (atoi(v.c_str()) != 0);
+            else if (k == "aa_quality") aaQ = atoi(v.c_str());
+            else if (k == "aa_strength") aaS = (float)atof(v.c_str());
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
@@ -414,6 +424,9 @@ static void LoadConfig() {
     g_btnAlpha = btnAlpha < 0.1f ? 0.1f : (btnAlpha > 1.0f ? 1.0f : btnAlpha);
     g_panelAlpha = panelAlpha < 0.4f ? 0.4f : (panelAlpha > 1.0f ? 1.0f : panelAlpha);
     g_enabled = enabledV; g_autoSave = autoSaveV; g_tutorialDone = tutorialV; g_debugLog = debugV;
+    g_crashGuard = guardV; g_aa = aaV;
+    g_aaQuality = aaQ < 0 ? 0 : (aaQ > 2 ? 2 : aaQ);
+    g_aaStrength = aaS < 0.1f ? 0.1f : (aaS > 1.0f ? 1.0f : aaS);
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
     g_uniVersion++;
@@ -527,6 +540,7 @@ static void ResolveCars() {
 }
 
 static void SetEditableMaterials_hook(void* clump) {
+    if (!clump) return;   // cegah crash: game tidak boleh memproses clump NULL
     g_primary.clear();
     g_matSeen = 0;
     bool active = g_ready && g_enabled && clump;
@@ -699,6 +713,26 @@ static bool InstallGotHook(void* anySym, uintptr_t slotOff, uintptr_t expectOff,
     return true;
 }
 
+// ---------- pelindung crash: clump / geometry NULL ----------
+static void* (*RpClumpForAllAtomics_orig)(void*, void*, void*) = nullptr;
+static void* (*RpGeometryForAllMaterials_orig)(void*, void*, void*) = nullptr;
+static int g_nullGuardHits = 0;
+static void LogNullCaller(const char* fn, void* ra) {
+    if (g_nullGuardHits >= 6) return;
+    g_nullGuardHits++;
+    Dl_info di; const char* lib = "?"; long off = 0;
+    if (dladdr(ra, &di) && di.dli_fname) { lib = di.dli_fname; off = (long)((char*)ra - (char*)di.dli_fbase); }
+    logger->Error("%s(NULL) dilewati untuk mencegah crash. Pemanggil: %s + 0x%lx", fn, lib, off);
+}
+static void* RpClumpForAllAtomics_guard(void* clump, void* cb, void* data) {
+    if (!clump) { LogNullCaller("RpClumpForAllAtomics", __builtin_return_address(0)); return nullptr; }
+    return RpClumpForAllAtomics_orig(clump, cb, data);
+}
+static void* RpGeometryForAllMaterials_guard(void* geom, void* cb, void* data) {
+    if (!geom) { LogNullCaller("RpGeometryForAllMaterials", __builtin_return_address(0)); return nullptr; }
+    return RpGeometryForAllMaterials_orig(geom, cb, data);
+}
+
 // ---------- uniform live untuk shader chameleon ----------
 static void (*glUseProgram_orig)(unsigned) = nullptr;
 static void (*glLinkProgram_orig)(unsigned) = nullptr;
@@ -770,7 +804,7 @@ static void SaveConfig() {
     Pf(out, "shader_patch=%d\ngeom_offset=%d\n", g_shaderPatchEnabled ? 1 : 0, g_geomOff);
     Pf(out, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
             g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
-    Pf(out, "debug_log=%d\n", g_debugLog ? 1 : 0);
+    Pf(out, "debug_log=%d\ncrash_guard=%d\naa=%d\naa_quality=%d\naa_strength=%.2f\n", g_debugLog ? 1 : 0, g_crashGuard ? 1 : 0, g_aa ? 1 : 0, g_aaQuality, g_aaStrength);
     Pf(out, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
     Pf(out, "\n[cars]\n");
     for (auto& kv : g_carsCfg) Pf(out, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
@@ -956,6 +990,7 @@ static uint64_t SettingsHash() {
     f.v(g_angleGain); f.v(g_elevGain); f.v(g_partSpread); f.v(g_speed); f.v(g_intensity);
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
     f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
+    f.v(g_aa); f.v(g_aaQuality); f.v(g_aaStrength);
     for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
     f.s(g_curCustom);
     for (int i = 0; i < 8; i++) {
@@ -1045,6 +1080,7 @@ static void ResetAll() {
     g_tpl = (it != g_templates.end()) ? it->second : g_templates["custom"];
     g_editSlot = -1; g_pickSlot = -1;
     g_scopeCar = false; g_advanced = false; g_tutorialDone = false;
+    g_aa = false; g_aaQuality = 1; g_aaStrength = 1.0f;
     g_uniVersion++;
 }
 
@@ -1424,6 +1460,9 @@ static void TabUtama() {
     CardBegin();
     ToggleRow("Efek chameleon", &g_enabled);
     Hint(g_enabled ? "Aktif. Matikan untuk melihat warna asli mobil." : "Mati. Mobil tampil dengan warna aslinya.");
+    ImGui::Spacing();
+    ToggleRow("Anti-aliasing (FXAA)", &g_aa);
+    Hint(g_aaFailed ? "Anti-aliasing tidak didukung di perangkat ini." : "Menghaluskan tepi bergerigi. Atur kualitasnya di tab Lainnya.");
     CardEnd();
 
     CardBegin();
@@ -1729,6 +1768,19 @@ static void TabSistem() {
     ImGui::SameLine();
     if (Btn("Muat ulang dari file", ImVec2(bw, bh))) { LoadConfig(); g_uniVersion++; Toast("Pengaturan dimuat ulang"); }
 
+    SectionTitle("GRAFIS");
+    ToggleRow("Anti-aliasing (FXAA)", &g_aa);
+    Hint(g_aaFailed ? "Anti-aliasing tidak didukung di perangkat ini (penyalinan framebuffer gagal)."
+                    : "Menghaluskan tepi bergerigi di seluruh layar. Menambah sedikit beban GPU; matikan jika FPS turun.");
+    if (g_aa) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Kualitas");
+        static const char* kAaQ[] = {"Rendah", "Sedang", "Tinggi"};
+        Segmented("aaq", kAaQ, 3, &g_aaQuality);
+        ImGui::Spacing();
+        SliderHelp("Kekuatan", "Makin besar tepi makin halus, tetapi gambar sedikit lebih lembut.", &g_aaStrength, 0.1f, 1.0f);
+    }
+
     SectionTitle("TAMPILAN MENU");
     SliderHelp("Posisi tombol (kiri-kanan)", "Geser tombol PC agar tidak menghalangi layar.", &g_btnX, 0.0f, 0.95f);
     SliderHelp("Posisi tombol (atas-bawah)", "Geser tombol PC ke atas atau bawah.", &g_btnY, 0.0f, 0.9f);
@@ -1921,6 +1973,143 @@ static bool InitMenu() {
     return true;
 }
 
+// ================= anti-aliasing (FXAA) =================
+static GLuint g_aaProg = 0, g_aaTex = 0;
+static int g_aaW = 0, g_aaH = 0;
+static GLint g_aaLocTex = -1, g_aaLocRes = -1, g_aaLocStr = -1, g_aaLocSpan = -1;
+
+static GLuint AaCompile(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[300] = {0};
+        glGetShaderInfoLog(sh, sizeof log - 1, nullptr, log);
+        logger->Error("Shader AA gagal dikompilasi: %s", log);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static bool AaInit() {
+    static const char* vs =
+        "attribute vec2 aPos;\n"
+        "varying vec2 vUV;\n"
+        "void main() { vUV = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+    static const char* fs =
+        "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+        "precision highp float;\n"
+        "#else\n"
+        "precision mediump float;\n"
+        "#endif\n"
+        "uniform sampler2D uTex;\n"
+        "uniform vec2 uInvRes;\n"
+        "uniform float uStrength;\n"
+        "uniform float uSpan;\n"
+        "varying vec2 vUV;\n"
+        "float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
+        "void main() {\n"
+        "  vec3 rgbM  = texture2D(uTex, vUV).rgb;\n"
+        "  vec3 rgbNW = texture2D(uTex, vUV + vec2(-1.0, -1.0) * uInvRes).rgb;\n"
+        "  vec3 rgbNE = texture2D(uTex, vUV + vec2( 1.0, -1.0) * uInvRes).rgb;\n"
+        "  vec3 rgbSW = texture2D(uTex, vUV + vec2(-1.0,  1.0) * uInvRes).rgb;\n"
+        "  vec3 rgbSE = texture2D(uTex, vUV + vec2( 1.0,  1.0) * uInvRes).rgb;\n"
+        "  float lM = lum(rgbM), lNW = lum(rgbNW), lNE = lum(rgbNE), lSW = lum(rgbSW), lSE = lum(rgbSE);\n"
+        "  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));\n"
+        "  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
+        "  vec2 dir;\n"
+        "  dir.x = -((lNW + lNE) - (lSW + lSE));\n"
+        "  dir.y =  ((lNW + lSW) - (lNE + lSE));\n"
+        "  float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);\n"
+        "  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);\n"
+        "  dir = min(vec2(uSpan), max(vec2(-uSpan), dir * rcpDirMin)) * uInvRes;\n"
+        "  vec3 rgbA = 0.5 * (texture2D(uTex, vUV + dir * (1.0 / 3.0 - 0.5)).rgb + texture2D(uTex, vUV + dir * (2.0 / 3.0 - 0.5)).rgb);\n"
+        "  vec3 rgbB = rgbA * 0.5 + 0.25 * (texture2D(uTex, vUV + dir * -0.5).rgb + texture2D(uTex, vUV + dir * 0.5).rgb);\n"
+        "  float lB = lum(rgbB);\n"
+        "  vec3 col = (lB < lMin || lB > lMax) ? rgbA : rgbB;\n"
+        "  gl_FragColor = vec4(mix(rgbM, col, uStrength), 1.0);\n"
+        "}\n";
+    GLuint v = AaCompile(GL_VERTEX_SHADER, vs), f = AaCompile(GL_FRAGMENT_SHADER, fs);
+    if (!v || !f) return false;
+    GLuint pr = glCreateProgram();
+    glAttachShader(pr, v);
+    glAttachShader(pr, f);
+    glBindAttribLocation(pr, 0, "aPos");
+    glLinkProgram(pr);
+    GLint ok = 0;
+    glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    if (!ok) { logger->Error("Program AA gagal di-link"); glDeleteProgram(pr); return false; }
+    g_aaProg = pr;
+    g_aaLocTex = glGetUniformLocation(pr, "uTex");
+    g_aaLocRes = glGetUniformLocation(pr, "uInvRes");
+    g_aaLocStr = glGetUniformLocation(pr, "uStrength");
+    g_aaLocSpan = glGetUniformLocation(pr, "uSpan");
+    logger->Info("Anti-aliasing (FXAA) siap");
+    return true;
+}
+
+// salin framebuffer layar ke texture lalu gambar ulang dengan FXAA (sebelum UI menu digambar)
+static void ApplyAA(int W, int H) {
+    if (g_aaFailed) return;
+    if (!g_aaProg && !AaInit()) { g_aaFailed = true; return; }
+
+    GLint prevProg = 0, prevAct = 0, prevTex = 0, vpPrev[4] = {0, 0, 0, 0};
+    GLboolean eBlend = glIsEnabled(GL_BLEND), eDepth = glIsEnabled(GL_DEPTH_TEST), eScissor = glIsEnabled(GL_SCISSOR_TEST),
+              eCull = glIsEnabled(GL_CULL_FACE), eStencil = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevAct);
+    glGetIntegerv(GL_VIEWPORT, vpPrev);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    while (glGetError() != GL_NO_ERROR) {}
+
+    if (!g_aaTex) glGenTextures(1, &g_aaTex);
+    glBindTexture(GL_TEXTURE_2D, g_aaTex);
+    if (g_aaW != W || g_aaH != H) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, W, H, 0);
+        g_aaW = W; g_aaH = H;
+    } else {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
+    }
+    if (glGetError() != GL_NO_ERROR) {   // perangkat tidak mendukung penyalinan framebuffer: matikan AA
+        logger->Error("AA dimatikan: gagal menyalin framebuffer");
+        g_aaFailed = true;
+    } else {
+        glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+        glViewport(0, 0, W, H);
+        glUseProgram(g_aaProg);
+        static const float span[3] = {4.0f, 8.0f, 12.0f};
+        glUniform1i(g_aaLocTex, 0);
+        glUniform2f(g_aaLocRes, 1.0f / (float)W, 1.0f / (float)H);
+        glUniform1f(g_aaLocStr, g_aaStrength);
+        glUniform1f(g_aaLocSpan, span[g_aaQuality < 0 ? 0 : (g_aaQuality > 2 ? 2 : g_aaQuality)]);
+        static const float quad[8] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+        glEnableVertexAttribArray(0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    // pulihkan state milik game
+    glUseProgram((GLuint)prevProg);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+    glActiveTexture((GLenum)prevAct);
+    if (eBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (eDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (eScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (eCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    if (eStencil) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+    glViewport(vpPrev[0], vpPrev[1], vpPrev[2], vpPrev[3]);
+}
+
 struct AttribBackup { GLint en, size, type, norm, stride, buf; void* ptr; };
 
 static void DrawMenuFrame() {
@@ -1960,6 +2149,8 @@ static void DrawMenuFrame() {
         glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &ab[i].buf);
         glGetVertexAttribPointerv(i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ab[i].ptr);
     }
+
+    if (g_aa) ApplyAA(ww, hh);
 
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(W, H);
@@ -2049,6 +2240,10 @@ ON_MOD_PRELOAD() {
     LoadConfig();
     aml->Hook(hook_target, (void*)SetEditableMaterials_hook, (void**)&SetEditableMaterials_orig);
     g_ready = true;
+    if (g_crashGuard) {
+        InstallGotHook(hook_target, 0x83fd50, 0x2ba020, (void*)RpClumpForAllAtomics_guard, (void**)&RpClumpForAllAtomics_orig, "RpClumpForAllAtomics (pelindung NULL)");
+        InstallGotHook(hook_target, 0x844ef8, 0x2bce78, (void*)RpGeometryForAllMaterials_guard, (void**)&RpGeometryForAllMaterials_orig, "RpGeometryForAllMaterials (pelindung NULL)");
+    }
     EnsureCustomSlots();
     for (auto& kv : g_templates) if (!IsCustomName(kv.first) && g_palette.size() < 32) g_palette.push_back(kv.second);
     if (g_shaderPatchEnabled) {
