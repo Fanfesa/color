@@ -614,6 +614,34 @@ static void ReplaceAll(std::string& s, const std::string& a, const std::string& 
     while ((p = s.find(a, p)) != std::string::npos) { s.replace(p, a.size(), b); p += b.size(); }
 }
 
+// Penanda material primary di vertex shader: 0 = bukan penanda, 1..32 = template, 101..108 = slot custom
+static const char* kMarkerExpr =
+    "(abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? ((abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : "
+    "((abs(MaterialDiffuse.x * 255.0 - 5.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 101.0 : 0.0)) : 0.0";
+
+// Varian vertex shader TANPA pantulan (dipakai model LOD kendaraan jarak jauh): warna chameleon dihitung per-vertex
+// supaya efeknya tetap aktif di semua jarak (tanpa ini model LOD tampil hijau polos = warna penanda).
+static bool PatchVertexLod(std::string& src, const std::string& uniforms, size_t m) {
+    const size_t np = std::string::npos;
+    if (src.find("Out_Color =") == np) return false;
+    if (src.find("uniform lowp vec4 MaterialDiffuse") == np) return false;   // penanda tidak bisa dibaca
+    if (src.find("BoneToLocal") != np) return false;                        // lewati model berkerangka (ped)
+    size_t endMain = src.rfind('}');
+    if (endMain == np || endMain < m) return false;
+    bool hasN = src.find("vec3 WorldNormal") != np && src.find("vec3 WorldNormal = vec3(0.0, 0.0, 0.0)") == np &&
+                src.find("vec4 WorldPos") != np && src.find("uniform vec3 CameraPosition") != np;
+    std::string blk = std::string("{\n float chamI = ") + kMarkerExpr + ";\n if (chamI > 0.5) {\n  float chamT = 0.5;\n";
+    if (hasN)
+        blk += "  vec3 chamV = normalize(WorldPos.xyz - CameraPosition.xyz);\n"
+               "  chamT = clamp((1.0 - abs(dot(chamV, normalize(WorldNormal)))) * ChamP0.x + ChamP0.z, 0.0, 1.0);\n";
+    blk += "  float chamL = clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
+           "  Out_Color.xyz = ChamPal(chamI - 1.0, chamT) * (chamL * mix(1.0 - ChamP0.w, 1.0, chamT) * ChamP1.w);\n"
+           " }\n}\n";
+    src.insert(endMain, blk);
+    src.insert(m, uniforms + BuildPaletteFn());
+    return true;
+}
+
 static bool PatchShader(std::string& src) {
     const size_t np = std::string::npos;
     const std::string varyings = "varying mediump float Out_Cham;\nvarying mediump vec3 Out_WN;\nvarying mediump vec3 Out_VV;\n";
@@ -629,10 +657,10 @@ static bool PatchShader(std::string& src) {
     if (src.find("gl_Position") != np) {                       // vertex shader
         const std::string anchor = "vec3 reflVector = normalize(WorldPos.xyz - CameraPosition.xyz);";
         size_t a = src.find(anchor);
-        if (a == np || src.find("WorldNormal") == np) return false;
+        if (a == np) return PatchVertexLod(src, uniforms, m);   // varian tanpa pantulan (mis. model LOD jauh)
+        if (src.find("WorldNormal") == np) return false;
         std::string expr = "0.0";
-        if (src.find("uniform lowp vec4 MaterialDiffuse") != np)
-            expr = "(abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? ((abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : ((abs(MaterialDiffuse.x * 255.0 - 5.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 101.0 : 0.0)) : 0.0";
+        if (src.find("uniform lowp vec4 MaterialDiffuse") != np) expr = kMarkerExpr;
         src.replace(a, anchor.size(), anchor + "\nOut_WN = WorldNormal; Out_VV = reflVector; Out_Cham = " + expr + ";\n");
         src.insert(m, varyings);
         return true;
