@@ -260,6 +260,7 @@ static bool  g_aaFailed = false;           // AA tidak didukung perangkat
 static int   g_randomMode = 0;             // warna acak: 0 mati, 1 hanya mobil NPC, 2 semua mobil
 static int   g_randPool = 0;               // sumber acak: 0 semua, 1 gelap, 2 sedang, 3 terang
 static bool  g_randCustom = false;         // sertakan slot custom pada sumber acak
+static bool  g_lockOwned = true;           // mobil yang pernah dikendarai pemain tidak ikut diacak
 static bool  g_randDirty = true;           // daftar sumber acak perlu dibangun ulang
 static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
@@ -346,7 +347,7 @@ static void LoadConfig() {
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
     bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone, debugV = g_debugLog, aaV = g_aa, guardV = g_crashGuard;
     int aaQ = g_aaQuality; float aaS = g_aaStrength;
-    int randMode = g_randomMode, randPool = g_randPool; bool randCustom = g_randCustom;
+    int randMode = g_randomMode, randPool = g_randPool; bool randCustom = g_randCustom, randLock = g_lockOwned;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
@@ -402,6 +403,7 @@ static void LoadConfig() {
             else if (k == "random_mode") randMode = atoi(v.c_str());
             else if (k == "random_pool") randPool = atoi(v.c_str());
             else if (k == "random_custom") randCustom = (atoi(v.c_str()) != 0);
+            else if (k == "random_lock") randLock = (atoi(v.c_str()) != 0);
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
@@ -440,7 +442,7 @@ static void LoadConfig() {
     g_aaStrength = aaS < 0.1f ? 0.1f : (aaS > 1.0f ? 1.0f : aaS);
     g_randomMode = randMode < 0 ? 0 : (randMode > 2 ? 2 : randMode);
     g_randPool = randPool < 0 ? 0 : (randPool > 3 ? 3 : randPool);
-    g_randCustom = randCustom; g_randDirty = true;
+    g_randCustom = randCustom; g_lockOwned = randLock; g_randDirty = true;
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
     g_uniVersion++;
@@ -565,6 +567,17 @@ static std::unordered_set<void*> g_seenClumps;
 struct RandAssign { std::string name; int model; };
 static std::unordered_map<void*, RandAssign> g_randAssign;
 static std::vector<std::string> g_randNames;
+struct OwnedEntry { void* clump; int model; };
+static std::vector<OwnedEntry> g_owned;           // mobil yang pernah dikendarai pemain (maks 8 terakhir)
+static void MarkOwned(void* clump, int model) {
+    for (OwnedEntry& e : g_owned) if (e.clump == clump) { e.model = model; return; }
+    if (g_owned.size() >= 8) g_owned.erase(g_owned.begin());
+    g_owned.push_back({clump, model});
+}
+static bool IsOwned(void* clump, int model) {
+    for (const OwnedEntry& e : g_owned) if (e.clump == clump && e.model == model) return true;
+    return false;
+}
 
 static bool InPalette(const std::string& n) { for (const Template& t : g_palette) if (t.name == n) return true; return false; }
 
@@ -646,8 +659,10 @@ static void SetEditableMaterials_hook(void* clump) {
             active = false;   // mobil lain: tidak disentuh sama sekali (hemat CPU, tanpa jalan-jalan di material)
         }
         if (active && g_randomMode != 0) {   // warna acak: tetap untuk tiap mobil selama mobil itu ada
-            int ps = (g_randomMode == 2) ? 0 : PlayerClumpState(clump);
-            if (ps == 0) { const Template* rt = RandomTemplateFor(clump, mid); if (rt) tp = rt; }
+            int ps = PlayerClumpState(clump);
+            if (ps == 1) MarkOwned(clump, mid);   // ingat mobil milik pemain agar tetap terkunci setelah pemain keluar
+            bool doRandom = (g_randomMode == 2) || (ps == 0 && !(g_lockOwned && IsOwned(clump, mid)));
+            if (doRandom) { const Template* rt = RandomTemplateFor(clump, mid); if (rt) tp = rt; }
         }
     }
     if (active) RpClumpForAllAtomics(clump, OnAtomic, nullptr);
@@ -713,29 +728,9 @@ static const char* kMarkerExpr =
     "(abs(MaterialDiffuse.y * 255.0 - 253.0) < 1.5) ? ((abs(MaterialDiffuse.x * 255.0 - 1.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 1.0 : "
     "((abs(MaterialDiffuse.x * 255.0 - 5.0) < 1.5) ? floor(MaterialDiffuse.z * 255.0 / 8.0 + 0.5) + 101.0 : 0.0)) : 0.0";
 
-// Varian vertex shader TANPA pantulan (dipakai model LOD kendaraan jarak jauh): warna chameleon dihitung per-vertex
-// supaya efeknya tetap aktif di semua jarak (tanpa ini model LOD tampil hijau polos = warna penanda).
-static bool PatchVertexLod(std::string& src, const std::string& uniforms, size_t m) {
-    const size_t np = std::string::npos;
-    if (src.find("Out_Color =") == np) return false;
-    if (src.find("uniform lowp vec4 MaterialDiffuse") == np) return false;   // penanda tidak bisa dibaca
-    if (src.find("BoneToLocal") != np) return false;                        // lewati model berkerangka (ped)
-    size_t endMain = src.rfind('}');
-    if (endMain == np || endMain < m) return false;
-    bool hasN = src.find("vec3 WorldNormal") != np && src.find("vec3 WorldNormal = vec3(0.0, 0.0, 0.0)") == np &&
-                src.find("vec4 WorldPos") != np && src.find("uniform vec3 CameraPosition") != np;
-    std::string blk = std::string("{\n float chamI = ") + kMarkerExpr + ";\n if (chamI > 0.5) {\n  float chamT = 0.5;\n";
-    if (hasN)
-        blk += "  vec3 chamV = normalize(WorldPos.xyz - CameraPosition.xyz);\n"
-               "  chamT = clamp((1.0 - abs(dot(chamV, normalize(WorldNormal)))) * ChamP0.x + ChamP0.z, 0.0, 1.0);\n";
-    blk += "  float chamL = clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
-           "  Out_Color.xyz = ChamPal(chamI - 1.0, chamT) * (chamL * mix(1.0 - ChamP0.w, 1.0, chamT) * ChamP1.w);\n"
-           " }\n}\n";
-    src.insert(endMain, blk);
-    src.insert(m, uniforms + BuildPaletteFn());
-    return true;
-}
-
+// Semua shader berpencahayaan (yang memakai Out_Color) dipatch sepasang: vertex shader mengirim penanda + normal + arah
+// pandang, fragment shader menghitung warna chameleon PER PIKSEL. Dengan begitu model LOD kendaraan jarak jauh
+// (shader tanpa pantulan) juga memakai efek per piksel, bukan per vertex dan bukan hijau polos.
 static bool PatchShader(std::string& src) {
     const size_t np = std::string::npos;
     const std::string varyings = "varying mediump float Out_Cham;\nvarying mediump vec3 Out_WN;\nvarying mediump vec3 Out_VV;\n";
@@ -749,26 +744,31 @@ static bool PatchShader(std::string& src) {
     if (m == np) return false;
 
     if (src.find("gl_Position") != np) {                       // vertex shader
-        const std::string anchor = "vec3 reflVector = normalize(WorldPos.xyz - CameraPosition.xyz);";
-        size_t a = src.find(anchor);
-        if (a == np) return PatchVertexLod(src, uniforms, m);   // varian tanpa pantulan (mis. model LOD jauh)
-        if (src.find("WorldNormal") == np) return false;
-        std::string expr = "0.0";
-        if (src.find("uniform lowp vec4 MaterialDiffuse") != np) expr = kMarkerExpr;
-        src.replace(a, anchor.size(), anchor + "\nOut_WN = WorldNormal; Out_VV = reflVector; Out_Cham = " + expr + ";\n");
+        if (src.find("Out_Color =") == np) return false;        // hanya shader yang menulis Out_Color
+        size_t endMain = src.rfind('}');
+        if (endMain == np || endMain < m) return false;
+        bool hasMD = src.find("uniform lowp vec4 MaterialDiffuse") != np;
+        bool hasN = src.find("vec3 WorldNormal") != np && src.find("vec3 WorldNormal = vec3(0.0, 0.0, 0.0)") == np;
+        bool hasV = src.find("vec4 WorldPos") != np && src.find("uniform vec3 CameraPosition") != np;
+        std::string blk = std::string("Out_Cham = ") + (hasMD ? std::string("(") + kMarkerExpr + ")" : std::string("0.0")) + ";\n";
+        blk += hasN ? "Out_WN = WorldNormal;\n" : "Out_WN = vec3(0.0, 0.0, 1.0);\n";
+        blk += hasV ? "Out_VV = normalize(WorldPos.xyz - CameraPosition.xyz);\n" : "Out_VV = vec3(0.0, 1.0, 0.0);\n";
+        src.insert(endMain, blk);
         src.insert(m, varyings);
         return true;
     }
     if (src.find("gl_FragColor") != np) {                      // fragment shader
-        if (src.find("EnvMapCoefficient") == np || src.find("Out_Color") == np) return false;
+        if (src.find("Out_Color") == np) return false;
+        bool hasEnv = src.find("EnvMapCoefficient") != np;     // varian dengan pantulan lingkungan
         size_t br = src.find('{', m);
         if (br == np) return false;
         std::string head = src.substr(0, m), mid = src.substr(m, br + 1 - m), body = src.substr(br + 1);
         ReplaceAll(body, "Out_Color", "CCol");
-        ReplaceAll(body, "EnvMapCoefficient", "CEnv");
+        if (hasEnv) ReplaceAll(body, "EnvMapCoefficient", "CEnv");
         std::string block =
-            "lowp vec4 CCol = Out_Color;\n"
-            "lowp float CEnv = EnvMapCoefficient;\n"
+            "lowp vec4 CCol = Out_Color;\n";
+        if (hasEnv) block += "lowp float CEnv = EnvMapCoefficient;\n";
+        block +=
             "if (Out_Cham > 0.5) {\n"
             " mediump vec3 cN = normalize(Out_WN);\n"
             " mediump vec3 cV = normalize(Out_VV);\n"
@@ -782,9 +782,9 @@ static bool PatchShader(std::string& src) {
             " mediump float cT = clamp(cF * ChamP0.x + cR.z * ChamP0.y + ChamP0.z + (cG - 0.5) * ChamP1.z * 0.6, 0.0, 1.0);\n"
             " mediump float cL = clamp(Out_Color.y * 1.008, 0.0, 1.0);\n"
             " mediump float cS = mix(1.0 - ChamP0.w, 1.0, cT);\n"
-            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * (cL * cS * ChamP1.w) * (1.0 + (cG - 0.5) * ChamP1.z);\n"
-            " CEnv = clamp(max(EnvMapCoefficient, ChamP1.x) + cF * cF * ChamP1.y, 0.0, 0.7);\n"
-            "}\n";
+            " CCol.xyz = ChamPal(Out_Cham - 1.0, cT) * (cL * cS * ChamP1.w) * (1.0 + (cG - 0.5) * ChamP1.z);\n";
+        if (hasEnv) block += " CEnv = clamp(max(EnvMapCoefficient, ChamP1.x) + cF * cF * ChamP1.y, 0.0, 0.7);\n";
+        block += "}\n";
         src = head + varyings + uniforms + BuildPaletteFn() + mid + "\n" + block + body;
         return true;
     }
@@ -927,7 +927,7 @@ static void SaveConfig() {
     Pf(out, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
             g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
     Pf(out, "debug_log=%d\ncrash_guard=%d\naa=%d\naa_quality=%d\naa_strength=%.2f\n", g_debugLog ? 1 : 0, g_crashGuard ? 1 : 0, g_aa ? 1 : 0, g_aaQuality, g_aaStrength);
-    Pf(out, "random_mode=%d\nrandom_pool=%d\nrandom_custom=%d\n", g_randomMode, g_randPool, g_randCustom ? 1 : 0);
+    Pf(out, "random_mode=%d\nrandom_pool=%d\nrandom_custom=%d\nrandom_lock=%d\n", g_randomMode, g_randPool, g_randCustom ? 1 : 0, g_lockOwned ? 1 : 0);
     Pf(out, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
     Pf(out, "\n[cars]\n");
     for (auto& kv : g_carsCfg) Pf(out, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
@@ -1114,7 +1114,7 @@ static uint64_t SettingsHash() {
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
     f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
     f.v(g_aa); f.v(g_aaQuality); f.v(g_aaStrength);
-    f.v(g_randomMode); f.v(g_randPool); f.v(g_randCustom);
+    f.v(g_randomMode); f.v(g_randPool); f.v(g_randCustom); f.v(g_lockOwned);
     for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
     f.s(g_curCustom);
     for (int i = 0; i < 8; i++) {
@@ -1205,7 +1205,7 @@ static void ResetAll() {
     g_editSlot = -1; g_pickSlot = -1;
     g_scopeCar = false; g_advanced = false; g_tutorialDone = false;
     g_aa = false; g_aaQuality = 1; g_aaStrength = 1.0f;
-    g_randomMode = 0; g_randPool = 0; g_randCustom = false; g_randAssign.clear(); g_randDirty = true;
+    g_randomMode = 0; g_randPool = 0; g_randCustom = false; g_lockOwned = true; g_randAssign.clear(); g_owned.clear(); g_randDirty = true;
     g_uniVersion++;
 }
 
@@ -1852,6 +1852,12 @@ static void TabMobil() {
             if (Segmented("rp", kRp, 4, &g_randPool)) g_randDirty = true;
             ImGui::Spacing();
             if (ToggleRow("Sertakan warna buatanku", &g_randCustom)) g_randDirty = true;
+            if (g_randomMode == 1) {
+                ImGui::Spacing();
+                ToggleRow("Kunci mobil yang pernah kukendarai", &g_lockOwned);
+                Hint("Mobil yang pernah kamu naiki tetap memakai warna pilihanmu walau kamu sudah keluar. Yang diingat 8 mobil terakhir.");
+                if (g_lockOwned && Btn("Lepas semua kunci", ImVec2(AvailW(), bh))) { g_owned.clear(); Toast("Kunci mobil dilepas"); }
+            }
             Hint("Warna acak tetap selama mobil itu ada. Berlaku untuk mobil yang ikut berwarna (lihat saklar 'Mobil lain ikut berwarna').");
             if (Btn("Acak ulang semua mobil", ImVec2(AvailW(), bh))) { g_randAssign.clear(); Toast("Warna acak diacak ulang"); }
         }
