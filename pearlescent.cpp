@@ -261,6 +261,8 @@ static int   g_randomMode = 0;             // warna acak: 0 mati, 1 hanya mobil 
 static int   g_randPool = 0;               // sumber acak: 0 semua, 1 gelap, 2 sedang, 3 terang
 static bool  g_randCustom = false;         // sertakan slot custom pada sumber acak
 static bool  g_lockOwned = true;           // mobil yang pernah dikendarai pemain tidak ikut diacak
+static bool  g_keepNpcColor = true;        // mobil NPC yang dinaiki pemain mempertahankan warna acaknya
+static bool  g_spawnOwn = true;            // mobil hasil spawn skrip (CLEO) langsung memakai warna pilihan pemain
 static bool  g_randDirty = true;           // daftar sumber acak perlu dibangun ulang
 static float g_btnAlpha = 1.0f, g_panelAlpha = 0.97f;   // transparansi tombol & panel menu
 struct PresetSlot { bool used = false; RGB a{0, 0, 0}, b{0, 0, 0}, c{0, 0, 0}; };
@@ -347,7 +349,7 @@ static void LoadConfig() {
     float chamReflect = g_chamReflect, chamFresnel = g_chamFresnel, chamDepth = g_chamDepth, chamFlake = g_chamFlake, chamBright = g_chamBright;
     bool shaderPatch = g_shaderPatchEnabled, menuOn = g_menuEnabled, enabledV = g_enabled, autoSaveV = g_autoSave, tutorialV = g_tutorialDone, debugV = g_debugLog, aaV = g_aa, guardV = g_crashGuard;
     int aaQ = g_aaQuality; float aaS = g_aaStrength;
-    int randMode = g_randomMode, randPool = g_randPool; bool randCustom = g_randCustom, randLock = g_lockOwned;
+    int randMode = g_randomMode, randPool = g_randPool; bool randCustom = g_randCustom, randLock = g_lockOwned, randKeep = g_keepNpcColor, randSpawn = g_spawnOwn;
     PresetSlot pre[6];
     PresetSlot* curPre = nullptr;
     float menuScale = g_menuScale, btnX = g_btnX, btnY = g_btnY, btnAlpha = g_btnAlpha, panelAlpha = g_panelAlpha;
@@ -404,6 +406,8 @@ static void LoadConfig() {
             else if (k == "random_pool") randPool = atoi(v.c_str());
             else if (k == "random_custom") randCustom = (atoi(v.c_str()) != 0);
             else if (k == "random_lock") randLock = (atoi(v.c_str()) != 0);
+            else if (k == "random_keep") randKeep = (atoi(v.c_str()) != 0);
+            else if (k == "random_spawn") randSpawn = (atoi(v.c_str()) != 0);
             else if (k == "menu_scale") menuScale = (float)atof(v.c_str());
             else if (k == "menu_button_x") btnX = (float)atof(v.c_str());
             else if (k == "menu_button_y") btnY = (float)atof(v.c_str());
@@ -442,7 +446,7 @@ static void LoadConfig() {
     g_aaStrength = aaS < 0.1f ? 0.1f : (aaS > 1.0f ? 1.0f : aaS);
     g_randomMode = randMode < 0 ? 0 : (randMode > 2 ? 2 : randMode);
     g_randPool = randPool < 0 ? 0 : (randPool > 3 ? 3 : randPool);
-    g_randCustom = randCustom; g_lockOwned = randLock; g_randDirty = true;
+    g_randCustom = randCustom; g_lockOwned = randLock; g_keepNpcColor = randKeep; g_spawnOwn = randSpawn; g_randDirty = true;
     for (int i = 0; i < 6; i++) g_presets[i] = pre[i];
     g_hashInit = false;
     g_uniVersion++;
@@ -564,7 +568,7 @@ static int LumClass(const Template& t) {   // 1 = gelap, 2 = sedang, 3 = terang
 // ---------- warna acak otomatis per kendaraan ----------
 static int g_clumpOff = -1;                       // offset pointer clump di objek CVehicle (dideteksi otomatis)
 static std::unordered_set<void*> g_seenClumps;
-struct RandAssign { std::string name; int model; };
+struct RandAssign { std::string name; int model; bool forced; };
 static std::unordered_map<void*, RandAssign> g_randAssign;
 static std::vector<std::string> g_randNames;
 struct OwnedEntry { void* clump; int model; };
@@ -595,7 +599,7 @@ static void RebuildRandPool() {
     g_randDirty = false;
 }
 
-static const Template* RandomTemplateFor(void* clump, int model) {
+static const Template* RandomTemplateFor(void* clump, int model, bool forced = false) {
     auto it = g_randAssign.find(clump);
     if (it != g_randAssign.end() && it->second.model == model) {
         auto t = g_templates.find(it->second.name);
@@ -608,7 +612,7 @@ static const Template* RandomTemplateFor(void* clump, int model) {
     int n = (int)g_randNames.size(), idx = 0;
     if (n > 1) { do { idx = rand() % n; } while (idx == last); }
     last = idx;
-    g_randAssign[clump] = { g_randNames[idx], model };
+    g_randAssign[clump] = { g_randNames[idx], model, forced };
     auto t = g_templates.find(g_randNames[idx]);
     return t != g_templates.end() ? &t->second : nullptr;
 }
@@ -631,6 +635,49 @@ static void CalibrateClumpOffset(void* clump) {
     }
 }
 
+struct V3f { float x, y, z; };                       // CVector (HFA: dikirim lewat register float seperti aslinya)
+static std::vector<void*> g_pendingVeh;               // CVehicle* hasil CreateCarForScript yang belum dicocokkan dengan clump
+static std::unordered_map<void*, int> g_scriptClumps; // clump -> model, untuk mobil hasil spawn skrip (CLEO/misi)
+static std::unordered_set<void*> g_npcSeen;           // clump yang sudah dipastikan bukan hasil spawn skrip
+static void* (*CreateCarForScript_orig)(int, V3f, unsigned char) = nullptr;
+static void* CreateCarForScript_hook(int model, V3f pos, unsigned char cleanup) {
+    void* veh = CreateCarForScript_orig(model, pos, cleanup);
+    if (veh) {
+        if (g_pendingVeh.size() >= 16) g_pendingVeh.erase(g_pendingVeh.begin());
+        g_pendingVeh.push_back(veh);
+    }
+    return veh;
+}
+static bool IsScriptCar(void* clump, int model) {
+    auto it = g_scriptClumps.find(clump);
+    if (it != g_scriptClumps.end()) {
+        if (it->second == model || it->second < 0 || model < 0) return true;
+        g_scriptClumps.erase(it);                      // alamat dipakai ulang oleh model lain
+    }
+    if (g_npcSeen.count(clump)) return false;
+    for (size_t i = 0; i < g_pendingVeh.size(); i++) {
+        const char* v = (const char*)g_pendingVeh[i];
+        for (int off = 8; off <= 0x78; off += 8) {
+            if (*(void* const*)(v + off) == clump) {
+                if (g_clumpOff < 0) { g_clumpOff = off; logger->Info("Offset clump kendaraan terdeteksi (spawn): 0x%x", off); }
+                if (g_scriptClumps.size() > 256) g_scriptClumps.clear();
+                g_scriptClumps[clump] = model;
+                g_pendingVeh.erase(g_pendingVeh.begin() + (long)i);
+                if (g_debugLog) logger->Info("Mobil hasil spawn skrip terdeteksi (model %d)", model);
+                return true;
+            }
+        }
+    }
+    if (g_npcSeen.size() > 1024) g_npcSeen.clear();
+    g_npcSeen.insert(clump);
+    return false;
+}
+
+static bool HasRandAssign(void* clump, int model) {
+    auto it = g_randAssign.find(clump);
+    return it != g_randAssign.end() && it->second.model == model;
+}
+
 // 1 = mobil yang sedang dikendarai pemain, 0 = bukan, -1 = belum diketahui
 static int PlayerClumpState(void* clump) {
     if (!FindPlayerVehicle_fn) return -1;
@@ -640,6 +687,12 @@ static int PlayerClumpState(void* clump) {
     return (*(void**)((char*)v + g_clumpOff) == clump) ? 1 : 0;
 }
 
+static void* CurrentVehicleClump() {
+    if (!FindPlayerVehicle_fn || g_clumpOff < 0) return nullptr;
+    void* v = FindPlayerVehicle_fn(-1, false);
+    return v ? *(void**)((char*)v + g_clumpOff) : nullptr;
+}
+
 static void SetEditableMaterials_hook(void* clump) {
     if (!clump) return;   // cegah crash: game tidak boleh memproses clump NULL
     if (g_ready && g_clumpOff < 0) CalibrateClumpOffset(clump);
@@ -647,10 +700,13 @@ static void SetEditableMaterials_hook(void* clump) {
     g_matSeen = 0;
     bool active = g_ready && g_enabled && clump;
     const Template* tp = &g_tpl;
+    int mid = -1;
+    bool scriptCar = false;
+    if (g_ready && g_spawnOwn) { mid = ModelIdOf(clump); scriptCar = IsScriptCar(clump, mid); }   // klasifikasi pada penampakan pertama
     if (active) {
         MaybeReload();
         if (g_needResolve) ResolveCars();
-        int mid = ModelIdOf(clump);
+        if (mid < 0) mid = ModelIdOf(clump);
         auto car = g_carById.find(mid);
         if (car != g_carById.end()) {
             auto tt = g_templates.find(car->second);
@@ -660,8 +716,15 @@ static void SetEditableMaterials_hook(void* clump) {
         }
         if (active && g_randomMode != 0) {   // warna acak: tetap untuk tiap mobil selama mobil itu ada
             int ps = PlayerClumpState(clump);
-            if (ps == 1) MarkOwned(clump, mid);   // ingat mobil milik pemain agar tetap terkunci setelah pemain keluar
-            bool doRandom = (g_randomMode == 2) || (ps == 0 && !(g_lockOwned && IsOwned(clump, mid)));
+            if (ps == 1) MarkOwned(clump, mid);   // ingat mobil yang pernah dikendarai pemain
+            bool doRandom;
+            bool assigned = HasRandAssign(clump, mid);
+            bool forced = assigned && g_randAssign[clump].forced;                          // diacak manual lewat menu
+            if (g_randomMode == 2) doRandom = true;                                        // semua mobil diacak
+            else if (forced) doRandom = true;
+            else if (scriptCar) doRandom = false;                                          // mobil hasil spawn skrip (CLEO): langsung warna pilihanmu
+            else if (g_keepNpcColor && assigned) doRandom = true;                          // mobil NPC yang sudah punya warna acak: tetap, juga saat dinaiki
+            else doRandom = (ps == 0) && !(g_lockOwned && IsOwned(clump, mid));            // NPC baru: beri warna acak; mobil pemain: warna pilihan
             if (doRandom) { const Template* rt = RandomTemplateFor(clump, mid); if (rt) tp = rt; }
         }
     }
@@ -927,7 +990,7 @@ static void SaveConfig() {
     Pf(out, "cham_gain=%.2f\ncham_flow=%.2f\ncham_bias=%.2f\ncham_reflect=%.2f\ncham_fresnel=%.2f\ncham_depth=%.2f\ncham_flake=%.2f\ncham_brightness=%.2f\n",
             g_chamGain, g_chamFlow, g_chamBias, g_chamReflect, g_chamFresnel, g_chamDepth, g_chamFlake, g_chamBright);
     Pf(out, "debug_log=%d\ncrash_guard=%d\naa=%d\naa_quality=%d\naa_strength=%.2f\n", g_debugLog ? 1 : 0, g_crashGuard ? 1 : 0, g_aa ? 1 : 0, g_aaQuality, g_aaStrength);
-    Pf(out, "random_mode=%d\nrandom_pool=%d\nrandom_custom=%d\nrandom_lock=%d\n", g_randomMode, g_randPool, g_randCustom ? 1 : 0, g_lockOwned ? 1 : 0);
+    Pf(out, "random_mode=%d\nrandom_pool=%d\nrandom_custom=%d\nrandom_lock=%d\nrandom_keep=%d\nrandom_spawn=%d\n", g_randomMode, g_randPool, g_randCustom ? 1 : 0, g_lockOwned ? 1 : 0, g_keepNpcColor ? 1 : 0, g_spawnOwn ? 1 : 0);
     Pf(out, "menu=%d\nmenu_scale=%.2f\nmenu_button_x=%.2f\nmenu_button_y=%.2f\nmenu_button_alpha=%.2f\nmenu_panel_alpha=%.2f\n", g_menuEnabled ? 1 : 0, g_menuScale, g_btnX, g_btnY, g_btnAlpha, g_panelAlpha);
     Pf(out, "\n[cars]\n");
     for (auto& kv : g_carsCfg) Pf(out, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
@@ -1114,7 +1177,7 @@ static uint64_t SettingsHash() {
     f.v(g_chamGain); f.v(g_chamFlow); f.v(g_chamBias); f.v(g_chamReflect); f.v(g_chamFresnel); f.v(g_chamDepth); f.v(g_chamFlake); f.v(g_chamBright);
     f.v(g_btnX); f.v(g_btnY); f.v(g_btnAlpha); f.v(g_panelAlpha);
     f.v(g_aa); f.v(g_aaQuality); f.v(g_aaStrength);
-    f.v(g_randomMode); f.v(g_randPool); f.v(g_randCustom); f.v(g_lockOwned);
+    f.v(g_randomMode); f.v(g_randPool); f.v(g_randCustom); f.v(g_lockOwned); f.v(g_keepNpcColor); f.v(g_spawnOwn);
     for (auto& kv : g_carsCfg) { f.s(kv.first); f.s(kv.second); }
     f.s(g_curCustom);
     for (int i = 0; i < 8; i++) {
@@ -1205,7 +1268,7 @@ static void ResetAll() {
     g_editSlot = -1; g_pickSlot = -1;
     g_scopeCar = false; g_advanced = false; g_tutorialDone = false;
     g_aa = false; g_aaQuality = 1; g_aaStrength = 1.0f;
-    g_randomMode = 0; g_randPool = 0; g_randCustom = false; g_lockOwned = true; g_randAssign.clear(); g_owned.clear(); g_randDirty = true;
+    g_randomMode = 0; g_randPool = 0; g_randCustom = false; g_lockOwned = true; g_keepNpcColor = true; g_spawnOwn = true; g_randAssign.clear(); g_owned.clear(); g_randDirty = true;
     g_uniVersion++;
 }
 
@@ -1587,7 +1650,7 @@ static void TabUtama() {
     {
         bool rnd = (g_randomMode != 0);
         if (ToggleRow("Warna acak untuk mobil NPC", &rnd)) g_randomMode = rnd ? 1 : 0;
-        Hint(rnd ? "Mobil NPC mendapat warna chameleon acak. Mobilmu tetap memakai warna pilihanmu. Atur di tab Mobil."
+        Hint(rnd ? "Mobil NPC mendapat warna chameleon acak dan tetap memakainya saat kamu naiki. Mobilmu sendiri memakai warna pilihanmu. Atur di tab Mobil."
                  : "Mati. Semua mobil sejenis memakai warna yang sama.");
     }
     CardEnd();
@@ -1854,6 +1917,12 @@ static void TabMobil() {
             if (ToggleRow("Sertakan warna buatanku", &g_randCustom)) g_randDirty = true;
             if (g_randomMode == 1) {
                 ImGui::Spacing();
+                ToggleRow("Pertahankan warna saat naik mobil NPC", &g_keepNpcColor);
+                Hint("Mobil NPC yang kamu naiki tetap memakai warna acaknya. Matikan agar mobil itu berganti ke warna pilihanmu saat dinaiki.");
+                ImGui::Spacing();
+                ToggleRow("Mobil hasil spawn (CLEO) pakai warna pilihanku", &g_spawnOwn);
+                Hint("Mobil yang kamu spawn lewat skrip seperti CLEO langsung memakai warna pilihanmu, tidak dianggap NPC. Mobil dari misi cerita game juga ikut.");
+                ImGui::Spacing();
                 ToggleRow("Kunci mobil yang pernah kukendarai", &g_lockOwned);
                 Hint("Mobil yang pernah kamu naiki tetap memakai warna pilihanmu walau kamu sudah keluar. Yang diingat 8 mobil terakhir.");
                 if (g_lockOwned && Btn("Lepas semua kunci", ImVec2(AvailW(), bh))) { g_owned.clear(); Toast("Kunci mobil dilepas"); }
@@ -1866,6 +1935,21 @@ static void TabMobil() {
     SectionTitle("MOBIL YANG DIKENDARAI");
     if (g_curCar >= 0) {
         ShowVehicleInfo();
+        if (g_randomMode == 1) {
+            void* cc = CurrentVehicleClump();
+            if (cc) {
+                int cm = ModelIdOf(cc);
+                bool assigned = HasRandAssign(cc, cm);
+                std::string nm = "pilihanmu";
+                if (assigned) { auto ra = g_randAssign.find(cc); if (ra != g_randAssign.end()) nm = "acak - " + DisplayName(ra->second.name); }
+                Hint("Warna mobil ini: " + nm);
+                float b2s = (AvailW() - sp) / 2.0f;
+                if (Btn("Pakai warna pilihanku", ImVec2(b2s, bh))) { g_randAssign.erase(cc); MarkOwned(cc, cm); Toast("Mobil ini memakai warna pilihanmu"); }
+                ImGui::SameLine();
+                if (Btn("Acak warna mobil ini", ImVec2(b2s, bh))) { g_randAssign.erase(cc); RandomTemplateFor(cc, cm, true); Toast("Warna mobil ini diacak"); }
+                ImGui::Spacing();
+            }
+        }
         auto ex = g_carsCfg.find(std::to_string(g_curCar));
         float b2 = (AvailW() - sp) / 2.0f;
         if (ex == g_carsCfg.end()) {
@@ -2392,6 +2476,9 @@ ON_MOD_PRELOAD() {
     LoadConfig();
     aml->Hook(hook_target, (void*)SetEditableMaterials_hook, (void**)&SetEditableMaterials_orig);
     g_ready = true;
+    if (g_spawnOwn) {
+        InstallGotHook(hook_target, 0x83ece8, 0x3afa70, (void*)CreateCarForScript_hook, (void**)&CreateCarForScript_orig, "CCarCtrl::CreateCarForScript");
+    }
     if (g_crashGuard) {
         InstallGotHook(hook_target, 0x83fd50, 0x2ba020, (void*)RpClumpForAllAtomics_guard, (void**)&RpClumpForAllAtomics_orig, "RpClumpForAllAtomics (pelindung NULL)");
         InstallGotHook(hook_target, 0x844ef8, 0x2bce78, (void*)RpGeometryForAllMaterials_guard, (void**)&RpGeometryForAllMaterials_orig, "RpGeometryForAllMaterials (pelindung NULL)");
